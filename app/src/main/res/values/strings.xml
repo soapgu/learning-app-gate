@@ -8,5 +8,9 @@
     <string name="launch_target">启动%1$s</string>
     <string name="launch_succeeded">已启动：%1$s</string>
     <string name="launch_failed">启动失败：%1$s</string>
+    <string name="accessibility_service_name">豆包访问守卫</string>
+    <string name="accessibility_service_description">观察目标应用进入和离开前台，仅记录包名和窗口事件，不读取页面内容。</string>
+    <string name="accessibility_enabled">无障碍服务：已开启</string>
+    <string name="accessibility_disabled">无障碍服务：未开启</string>
+    <string name="open_accessibility_settings">打开无障碍设置</string>
 </resources>
-

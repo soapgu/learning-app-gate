@@ -1,6 +1,8 @@
 package com.soapgu.learningappgate
 
+import android.content.Intent
 import android.os.Bundle
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -12,6 +14,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -24,6 +27,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import com.soapgu.learningappgate.accessibility.AccessibilityServiceStatus
+import com.soapgu.learningappgate.accessibility.GateAccessibilityService
 import com.soapgu.learningappgate.target.TargetApp
 import com.soapgu.learningappgate.target.TargetAppLaunchResult
 import com.soapgu.learningappgate.target.TargetAppLauncher
@@ -35,19 +40,22 @@ class MainActivity : ComponentActivity() {
     private lateinit var targetAppLauncher: TargetAppLauncher
     private var resolution by mutableStateOf<TargetAppResolution>(TargetAppResolution.NotInstalled)
     private var launchMessage by mutableStateOf<String?>(null)
+    private var accessibilityEnabled by mutableStateOf(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         targetAppLauncher = TargetAppLauncher(applicationContext)
-        refreshResolution()
+        refreshStatus()
         enableEdgeToEdge()
         setContent {
             LearningAppGateTheme {
                 MainScreen(
                     targetApp = TargetApps.DOUBAO,
                     resolution = resolution,
+                    accessibilityEnabled = accessibilityEnabled,
                     launchMessage = launchMessage,
                     onLaunch = ::launchTargetApp,
+                    onOpenAccessibilitySettings = ::openAccessibilitySettings,
                 )
             }
         }
@@ -56,12 +64,16 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         if (::targetAppLauncher.isInitialized) {
-            refreshResolution()
+            refreshStatus()
         }
     }
 
-    private fun refreshResolution() {
+    private fun refreshStatus() {
         resolution = targetAppLauncher.resolve(TargetApps.DOUBAO)
+        accessibilityEnabled = AccessibilityServiceStatus.isEnabled(
+            context = this,
+            serviceClass = GateAccessibilityService::class.java,
+        )
     }
 
     private fun launchTargetApp() {
@@ -75,14 +87,20 @@ class MainActivity : ComponentActivity() {
             is TargetAppLaunchResult.Failed -> getString(R.string.launch_failed, result.reason)
         }
     }
+
+    private fun openAccessibilitySettings() {
+        startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+    }
 }
 
 @Composable
 fun MainScreen(
     targetApp: TargetApp,
     resolution: TargetAppResolution,
+    accessibilityEnabled: Boolean,
     launchMessage: String?,
     onLaunch: () -> Unit,
+    onOpenAccessibilitySettings: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Scaffold(modifier = modifier.fillMaxSize()) { innerPadding ->
@@ -90,8 +108,10 @@ fun MainScreen(
             innerPadding = innerPadding,
             targetApp = targetApp,
             resolution = resolution,
+            accessibilityEnabled = accessibilityEnabled,
             launchMessage = launchMessage,
             onLaunch = onLaunch,
+            onOpenAccessibilitySettings = onOpenAccessibilitySettings,
         )
     }
 }
@@ -101,8 +121,10 @@ private fun MainContent(
     innerPadding: PaddingValues,
     targetApp: TargetApp,
     resolution: TargetAppResolution,
+    accessibilityEnabled: Boolean,
     launchMessage: String?,
     onLaunch: () -> Unit,
+    onOpenAccessibilitySettings: () -> Unit,
 ) {
     Column(
         modifier = Modifier
@@ -125,6 +147,20 @@ private fun MainContent(
             text = resolutionDescription(resolution),
             style = MaterialTheme.typography.bodyMedium,
         )
+        Spacer(modifier = Modifier.height(16.dp))
+        Text(
+            text = stringResource(
+                if (accessibilityEnabled) {
+                    R.string.accessibility_enabled
+                } else {
+                    R.string.accessibility_disabled
+                },
+            ),
+            style = MaterialTheme.typography.bodyLarge,
+        )
+        OutlinedButton(onClick = onOpenAccessibilitySettings) {
+            Text(stringResource(R.string.open_accessibility_settings))
+        }
         Spacer(modifier = Modifier.height(24.dp))
         Button(
             onClick = onLaunch,
@@ -166,8 +202,10 @@ private fun MainScreenPreview() {
                     "com.larus.home.impl.alias.AliasActivity1",
                 ),
             ),
+            accessibilityEnabled = false,
             launchMessage = null,
             onLaunch = {},
+            onOpenAccessibilitySettings = {},
         )
     }
 }
