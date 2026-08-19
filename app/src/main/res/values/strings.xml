@@ -1,5 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">豆包访问守卫</string>
+    <string name="target_package">目标包名：%1$s</string>
+    <string name="target_available">已安装，启动入口：%1$s</string>
+    <string name="target_not_installed">未安装目标应用</string>
+    <string name="target_no_launch_activity">目标应用没有可用的启动入口</string>
+    <string name="launch_target">启动%1$s</string>
+    <string name="launch_succeeded">已启动：%1$s</string>
+    <string name="launch_failed">启动失败：%1$s</string>
 </resources>
 
