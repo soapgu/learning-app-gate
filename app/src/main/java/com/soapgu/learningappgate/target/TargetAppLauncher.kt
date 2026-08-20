@@ -10,7 +10,12 @@ import com.orhanobut.logger.Logger
 
 /** 目标应用启动入口的解析结果，用于区分未安装和已安装但不可启动。 */
 sealed interface TargetAppResolution {
-    data class Available(val componentName: ComponentName) : TargetAppResolution
+    /** 已解析出可启动的组件与启动 Intent；Intent 与组件来自同一次解析，避免二次查询产生竞态。 */
+    data class Available(
+        val componentName: ComponentName,
+        val launchIntent: Intent,
+    ) : TargetAppResolution
+
     data object NotInstalled : TargetAppResolution
     data object NoLaunchActivity : TargetAppResolution
 }
@@ -37,6 +42,7 @@ class TargetAppLauncher(private val context: Context) {
             return TargetAppResolution.NotInstalled
         }
 
+        // 一次解析同时产出组件名和启动 Intent，launch() 直接复用，避免两次查询之间目标被卸载或更新。
         val launchIntent = packageManager.getLaunchIntentForPackage(targetApp.packageName)
             ?: return TargetAppResolution.NoLaunchActivity.also {
                 Logger.d("目标应用没有启动入口：${targetApp.packageName}")
@@ -47,7 +53,7 @@ class TargetAppLauncher(private val context: Context) {
             }
 
         Logger.d("已解析目标应用：${targetApp.packageName}，组件：${componentName.flattenToShortString()}")
-        return TargetAppResolution.Available(componentName)
+        return TargetAppResolution.Available(componentName, launchIntent)
     }
 
     fun launch(targetApp: TargetApp): TargetAppLaunchResult {
@@ -55,11 +61,9 @@ class TargetAppLauncher(private val context: Context) {
             TargetAppResolution.NotInstalled -> TargetAppLaunchResult.NotInstalled
             TargetAppResolution.NoLaunchActivity -> TargetAppLaunchResult.NoLaunchActivity
             is TargetAppResolution.Available -> {
-                val intent = packageManager.getLaunchIntentForPackage(targetApp.packageName)
-                    ?: return TargetAppLaunchResult.NoLaunchActivity
                 try {
                     // 持有的是 Application Context，启动 Activity 时必须创建新的任务栈入口。
-                    context.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                    context.startActivity(resolution.launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
                     Logger.d(
                         "已启动目标应用：${targetApp.packageName}，组件：" +
                             resolution.componentName.flattenToShortString(),

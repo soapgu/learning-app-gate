@@ -2,6 +2,7 @@ package com.soapgu.learningappgate
 
 import android.content.Intent
 import android.os.Bundle
+import android.os.SystemClock
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -29,6 +30,7 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import com.soapgu.learningappgate.accessibility.AccessibilityServiceStatus
 import com.soapgu.learningappgate.accessibility.GateAccessibilityService
+import com.soapgu.learningappgate.accessibility.InterceptionDiagnostics
 import com.soapgu.learningappgate.target.TargetApp
 import com.soapgu.learningappgate.target.TargetAppLaunchResult
 import com.soapgu.learningappgate.target.TargetAppLauncher
@@ -47,6 +49,8 @@ class MainActivity : ComponentActivity() {
     private var resolution by mutableStateOf<TargetAppResolution>(TargetAppResolution.NotInstalled)
     private var launchMessage by mutableStateOf<String?>(null)
     private var accessibilityEnabled by mutableStateOf(false)
+    private var interceptionCount by mutableStateOf(0)
+    private var lastInterceptionSeconds by mutableStateOf<Long?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -59,6 +63,8 @@ class MainActivity : ComponentActivity() {
                     targetApp = TargetApps.DOUBAO,
                     resolution = resolution,
                     accessibilityEnabled = accessibilityEnabled,
+                    interceptionCount = interceptionCount,
+                    lastInterceptionSeconds = lastInterceptionSeconds,
                     launchMessage = launchMessage,
                     onLaunch = ::launchTargetApp,
                     onOpenAccessibilitySettings = ::openAccessibilitySettings,
@@ -69,10 +75,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        // 用户可能刚从系统设置返回，或者在外部安装/卸载了目标应用，因此每次恢复都重新查询。
-        if (::targetAppLauncher.isInitialized) {
-            refreshStatus()
-        }
+        // 用户可能刚从系统设置返回，或者在外部安装/卸载了目标应用、触发过拦截，
+        // 因此每次恢复都重新查询状态和诊断数据。
+        refreshStatus()
     }
 
     private fun refreshStatus() {
@@ -81,6 +86,9 @@ class MainActivity : ComponentActivity() {
             context = this,
             serviceClass = GateAccessibilityService::class.java,
         )
+        interceptionCount = InterceptionDiagnostics.interceptionCount
+        lastInterceptionSeconds = InterceptionDiagnostics.lastInterceptionAtMs
+            ?.let { (SystemClock.elapsedRealtime() - it) / 1000 }
     }
 
     private fun launchTargetApp() {
@@ -108,6 +116,8 @@ fun MainScreen(
     targetApp: TargetApp,
     resolution: TargetAppResolution,
     accessibilityEnabled: Boolean,
+    interceptionCount: Int,
+    lastInterceptionSeconds: Long?,
     launchMessage: String?,
     onLaunch: () -> Unit,
     onOpenAccessibilitySettings: () -> Unit,
@@ -119,6 +129,8 @@ fun MainScreen(
             targetApp = targetApp,
             resolution = resolution,
             accessibilityEnabled = accessibilityEnabled,
+            interceptionCount = interceptionCount,
+            lastInterceptionSeconds = lastInterceptionSeconds,
             launchMessage = launchMessage,
             onLaunch = onLaunch,
             onOpenAccessibilitySettings = onOpenAccessibilitySettings,
@@ -132,6 +144,8 @@ private fun MainContent(
     targetApp: TargetApp,
     resolution: TargetAppResolution,
     accessibilityEnabled: Boolean,
+    interceptionCount: Int,
+    lastInterceptionSeconds: Long?,
     launchMessage: String?,
     onLaunch: () -> Unit,
     onOpenAccessibilitySettings: () -> Unit,
@@ -170,6 +184,19 @@ private fun MainContent(
         )
         OutlinedButton(onClick = onOpenAccessibilitySettings) {
             Text(stringResource(R.string.open_accessibility_settings))
+        }
+        if (interceptionCount > 0) {
+            Spacer(modifier = Modifier.height(16.dp))
+            Text(
+                text = stringResource(R.string.interception_count, interceptionCount),
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            lastInterceptionSeconds?.let { seconds ->
+                Text(
+                    text = stringResource(R.string.interception_last_at, seconds),
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
         }
         Spacer(modifier = Modifier.height(24.dp))
         Button(
@@ -212,8 +239,11 @@ private fun MainScreenPreview() {
                     "com.larus.nova",
                     "com.larus.home.impl.alias.AliasActivity1",
                 ),
+                android.content.Intent(),
             ),
             accessibilityEnabled = false,
+            interceptionCount = 0,
+            lastInterceptionSeconds = null,
             launchMessage = null,
             onLaunch = {},
             onOpenAccessibilitySettings = {},
