@@ -1,19 +1,23 @@
 package com.soapgu.learningappgate.accessibility
 
 import android.accessibilityservice.AccessibilityService
-import android.content.pm.ApplicationInfo
 import android.os.PowerManager
 import android.os.SystemClock
-import android.util.Log
 import android.view.accessibility.AccessibilityEvent
+import com.orhanobut.logger.Logger
 import com.soapgu.learningappgate.target.TargetApps
 
+/**
+ * M0.2 的无障碍事件观察服务。
+ *
+ * 本阶段只记录窗口事件的元数据，不读取页面节点、不采集豆包内容，也不执行 HOME 等全局操作。
+ */
 class GateAccessibilityService : AccessibilityService() {
     private val powerManager by lazy { getSystemService(PowerManager::class.java) }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-        debugLog("服务已连接")
+        Logger.d("服务已连接")
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -24,7 +28,8 @@ class GateAccessibilityService : AccessibilityService() {
         val packageName = event.packageName?.toString().orEmpty()
         val className = event.className?.toString().orEmpty()
         val isTarget = TargetAppEventMatcher.matches(event.packageName, TargetApps.DOUBAO)
-        debugLog(
+        // 单调时钟不受用户修改系统时间影响，后续可直接用于计算事件和拦截延迟。
+        Logger.d(
             "elapsedRealtime=${SystemClock.elapsedRealtime()} " +
                 "eventType=${AccessibilityEvent.eventTypeToString(event.eventType)} " +
                 "package=$packageName class=$className " +
@@ -33,26 +38,19 @@ class GateAccessibilityService : AccessibilityService() {
     }
 
     override fun onInterrupt() {
-        debugLog("服务被中断")
+        Logger.d("服务被中断")
     }
 
     override fun onDestroy() {
-        debugLog("服务已销毁")
+        Logger.d("服务已销毁")
         super.onDestroy()
     }
 
-    private fun debugLog(message: String) {
-        if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
-            Log.d(TAG, message)
-        }
-    }
-
     private companion object {
-        const val TAG = "GateAccessibility"
+        // 与无障碍服务 XML 中声明的事件类型保持一致，避免处理无关的页面内容事件。
         val OBSERVED_EVENT_TYPES = setOf(
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
             AccessibilityEvent.TYPE_WINDOWS_CHANGED,
         )
     }
 }
-

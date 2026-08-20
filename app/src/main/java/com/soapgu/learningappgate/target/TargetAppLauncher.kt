@@ -6,14 +6,16 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
-import android.util.Log
+import com.orhanobut.logger.Logger
 
+/** 目标应用启动入口的解析结果，用于区分未安装和已安装但不可启动。 */
 sealed interface TargetAppResolution {
     data class Available(val componentName: ComponentName) : TargetAppResolution
     data object NotInstalled : TargetAppResolution
     data object NoLaunchActivity : TargetAppResolution
 }
 
+/** 一次目标应用启动请求的结构化结果。 */
 sealed interface TargetAppLaunchResult {
     data class Started(val componentName: ComponentName) : TargetAppLaunchResult
     data object NotInstalled : TargetAppLaunchResult
@@ -21,25 +23,30 @@ sealed interface TargetAppLaunchResult {
     data class Failed(val reason: String) : TargetAppLaunchResult
 }
 
+/**
+ * 通过系统 PackageManager 解析并启动目标应用。
+ *
+ * 不硬编码豆包的 Activity 别名，避免应用升级或渠道差异导致启动入口失效。
+ */
 class TargetAppLauncher(private val context: Context) {
     private val packageManager = context.packageManager
 
     fun resolve(targetApp: TargetApp): TargetAppResolution {
         if (!isInstalled(targetApp.packageName)) {
-            log("未安装目标应用：${targetApp.packageName}")
+            Logger.d("未安装目标应用：${targetApp.packageName}")
             return TargetAppResolution.NotInstalled
         }
 
         val launchIntent = packageManager.getLaunchIntentForPackage(targetApp.packageName)
             ?: return TargetAppResolution.NoLaunchActivity.also {
-                log("目标应用没有启动入口：${targetApp.packageName}")
+                Logger.d("目标应用没有启动入口：${targetApp.packageName}")
             }
         val componentName = launchIntent.component
             ?: return TargetAppResolution.NoLaunchActivity.also {
-                log("目标应用启动 Intent 没有组件：${targetApp.packageName}")
+                Logger.d("目标应用启动 Intent 没有组件：${targetApp.packageName}")
             }
 
-        log("已解析目标应用：${targetApp.packageName}，组件：${componentName.flattenToShortString()}")
+        Logger.d("已解析目标应用：${targetApp.packageName}，组件：${componentName.flattenToShortString()}")
         return TargetAppResolution.Available(componentName)
     }
 
@@ -51,8 +58,9 @@ class TargetAppLauncher(private val context: Context) {
                 val intent = packageManager.getLaunchIntentForPackage(targetApp.packageName)
                     ?: return TargetAppLaunchResult.NoLaunchActivity
                 try {
+                    // 持有的是 Application Context，启动 Activity 时必须创建新的任务栈入口。
                     context.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-                    log(
+                    Logger.d(
                         "已启动目标应用：${targetApp.packageName}，组件：" +
                             resolution.componentName.flattenToShortString(),
                     )
@@ -68,6 +76,7 @@ class TargetAppLauncher(private val context: Context) {
 
     private fun isInstalled(packageName: String): Boolean {
         return try {
+            // Android 13 起使用类型安全的 Flags API，同时保留 minSdk 26 的兼容分支。
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 packageManager.getApplicationInfo(
                     packageName,
@@ -85,18 +94,7 @@ class TargetAppLauncher(private val context: Context) {
 
     private fun launchFailed(targetApp: TargetApp, error: RuntimeException): TargetAppLaunchResult.Failed {
         val reason = error::class.java.simpleName
-        log("启动目标应用失败：${targetApp.packageName}，原因：$reason")
+        Logger.d("启动目标应用失败：${targetApp.packageName}，原因：$reason")
         return TargetAppLaunchResult.Failed(reason)
     }
-
-    private fun log(message: String) {
-        if (context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) {
-            Log.d(TAG, message)
-        }
-    }
-
-    private companion object {
-        const val TAG = "TargetAppLauncher"
-    }
 }
-

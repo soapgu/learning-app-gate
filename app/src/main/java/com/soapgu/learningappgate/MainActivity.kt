@@ -36,6 +36,12 @@ import com.soapgu.learningappgate.target.TargetAppResolution
 import com.soapgu.learningappgate.target.TargetApps
 import com.soapgu.learningappgate.ui.theme.LearningAppGateTheme
 
+/**
+ * M0 阶段的诊断主页。
+ *
+ * 当前页面只展示目标应用和无障碍服务状态，并提供启动目标应用、打开系统设置的入口；
+ * 授权、计时和拦截逻辑会在后续里程碑中实现。
+ */
 class MainActivity : ComponentActivity() {
     private lateinit var targetAppLauncher: TargetAppLauncher
     private var resolution by mutableStateOf<TargetAppResolution>(TargetAppResolution.NotInstalled)
@@ -63,6 +69,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        // 用户可能刚从系统设置返回，或者在外部安装/卸载了目标应用，因此每次恢复都重新查询。
         if (::targetAppLauncher.isInitialized) {
             refreshStatus()
         }
@@ -93,6 +100,9 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+/**
+ * 主页的无状态 Compose 入口，所有系统操作均通过回调交给 Activity 执行。
+ */
 @Composable
 fun MainScreen(
     targetApp: TargetApp,
@@ -196,6 +206,7 @@ private fun MainScreenPreview() {
     LearningAppGateTheme {
         MainScreen(
             targetApp = TargetApps.DOUBAO,
+            // 预览组件只用于展示界面；正式启动时始终由 PackageManager 动态解析。
             resolution = TargetAppResolution.Available(
                 android.content.ComponentName(
                     "com.larus.nova",
