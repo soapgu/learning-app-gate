@@ -13,6 +13,9 @@
     <string name="accessibility_enabled">无障碍服务：已开启</string>
     <string name="accessibility_disabled">无障碍服务：未开启</string>
     <string name="open_accessibility_settings">打开无障碍设置</string>
+    <string name="exit_action_label">拦截方式</string>
+    <string name="exit_action_back">返回退出</string>
+    <string name="exit_action_home">回到桌面</string>
     <string name="interception_message">现在还不能使用豆包哦</string>
     <string name="interception_count">已拦截：%1$d 次</string>
     <string name="interception_last_at">最近拦截：%1$d 秒前</string>

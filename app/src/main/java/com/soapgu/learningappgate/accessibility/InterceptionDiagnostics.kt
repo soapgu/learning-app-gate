@@ -16,13 +16,20 @@ object InterceptionDiagnostics {
     var lastInterceptionAtMs: Long? = null
         private set
 
-    fun record(nowMs: Long) {
+    /** 最近一次拦截实际执行的退出方案；从未拦截时为 null。 */
+    @Volatile
+    var lastExitAction: ExitAction? = null
+        private set
+
+    fun record(nowMs: Long, exitAction: ExitAction = InterceptionActionPolicy.exitAction) {
         interceptionCount += 1
         lastInterceptionAtMs = nowMs
+        lastExitAction = exitAction
     }
 
     fun reset() {
         interceptionCount = 0
         lastInterceptionAtMs = null
+        lastExitAction = null
     }
 }

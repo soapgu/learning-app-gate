@@ -10,11 +10,13 @@ import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
@@ -29,7 +31,9 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import com.soapgu.learningappgate.accessibility.AccessibilityServiceStatus
+import com.soapgu.learningappgate.accessibility.ExitAction
 import com.soapgu.learningappgate.accessibility.GateAccessibilityService
+import com.soapgu.learningappgate.accessibility.InterceptionActionPolicy
 import com.soapgu.learningappgate.accessibility.InterceptionDiagnostics
 import com.soapgu.learningappgate.target.TargetApp
 import com.soapgu.learningappgate.target.TargetAppLaunchResult
@@ -51,6 +55,7 @@ class MainActivity : ComponentActivity() {
     private var accessibilityEnabled by mutableStateOf(false)
     private var interceptionCount by mutableStateOf(0)
     private var lastInterceptionSeconds by mutableStateOf<Long?>(null)
+    private var exitAction by mutableStateOf(InterceptionActionPolicy.exitAction)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -65,6 +70,8 @@ class MainActivity : ComponentActivity() {
                     accessibilityEnabled = accessibilityEnabled,
                     interceptionCount = interceptionCount,
                     lastInterceptionSeconds = lastInterceptionSeconds,
+                    exitAction = exitAction,
+                    onExitActionChange = ::selectExitAction,
                     launchMessage = launchMessage,
                     onLaunch = ::launchTargetApp,
                     onOpenAccessibilitySettings = ::openAccessibilitySettings,
@@ -89,6 +96,12 @@ class MainActivity : ComponentActivity() {
         interceptionCount = InterceptionDiagnostics.interceptionCount
         lastInterceptionSeconds = InterceptionDiagnostics.lastInterceptionAtMs
             ?.let { (SystemClock.elapsedRealtime() - it) / 1000 }
+        exitAction = InterceptionActionPolicy.exitAction
+    }
+
+    private fun selectExitAction(action: ExitAction) {
+        InterceptionActionPolicy.exitAction = action
+        exitAction = action
     }
 
     private fun launchTargetApp() {
@@ -118,6 +131,8 @@ fun MainScreen(
     accessibilityEnabled: Boolean,
     interceptionCount: Int,
     lastInterceptionSeconds: Long?,
+    exitAction: ExitAction,
+    onExitActionChange: (ExitAction) -> Unit,
     launchMessage: String?,
     onLaunch: () -> Unit,
     onOpenAccessibilitySettings: () -> Unit,
@@ -131,6 +146,8 @@ fun MainScreen(
             accessibilityEnabled = accessibilityEnabled,
             interceptionCount = interceptionCount,
             lastInterceptionSeconds = lastInterceptionSeconds,
+            exitAction = exitAction,
+            onExitActionChange = onExitActionChange,
             launchMessage = launchMessage,
             onLaunch = onLaunch,
             onOpenAccessibilitySettings = onOpenAccessibilitySettings,
@@ -146,6 +163,8 @@ private fun MainContent(
     accessibilityEnabled: Boolean,
     interceptionCount: Int,
     lastInterceptionSeconds: Long?,
+    exitAction: ExitAction,
+    onExitActionChange: (ExitAction) -> Unit,
     launchMessage: String?,
     onLaunch: () -> Unit,
     onOpenAccessibilitySettings: () -> Unit,
@@ -184,6 +203,23 @@ private fun MainContent(
         )
         OutlinedButton(onClick = onOpenAccessibilitySettings) {
             Text(stringResource(R.string.open_accessibility_settings))
+        }
+        Spacer(modifier = Modifier.height(16.dp))
+        Text(
+            text = stringResource(R.string.exit_action_label),
+            style = MaterialTheme.typography.bodyLarge,
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            FilterChip(
+                selected = exitAction == ExitAction.BACK,
+                onClick = { onExitActionChange(ExitAction.BACK) },
+                label = { Text(stringResource(R.string.exit_action_back)) },
+            )
+            FilterChip(
+                selected = exitAction == ExitAction.HOME,
+                onClick = { onExitActionChange(ExitAction.HOME) },
+                label = { Text(stringResource(R.string.exit_action_home)) },
+            )
         }
         if (interceptionCount > 0) {
             Spacer(modifier = Modifier.height(16.dp))
@@ -244,6 +280,8 @@ private fun MainScreenPreview() {
             accessibilityEnabled = false,
             interceptionCount = 0,
             lastInterceptionSeconds = null,
+            exitAction = ExitAction.BACK,
+            onExitActionChange = {},
             launchMessage = null,
             onLaunch = {},
             onOpenAccessibilitySettings = {},

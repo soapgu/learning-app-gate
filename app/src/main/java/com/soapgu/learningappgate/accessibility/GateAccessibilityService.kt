@@ -1,6 +1,8 @@
 package com.soapgu.learningappgate.accessibility
 
 import android.accessibilityservice.AccessibilityService
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
 import android.view.accessibility.AccessibilityEvent
@@ -18,6 +20,7 @@ import com.soapgu.learningappgate.target.TargetApps
 class GateAccessibilityService : AccessibilityService() {
     private val powerManager by lazy { getSystemService(PowerManager::class.java) }
     private val interceptionStateMachine = GateInterceptionStateMachine()
+    private val mainHandler = Handler(Looper.getMainLooper())
     private lateinit var interceptionOverlay: InterceptionOverlay
 
     override fun onServiceConnected() {
@@ -71,21 +74,47 @@ class GateAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         Logger.d("服务已销毁")
+        mainHandler.removeCallbacksAndMessages(null)
         if (::interceptionOverlay.isInitialized) {
             interceptionOverlay.hide()
         }
         super.onDestroy()
     }
 
-    /** 执行一次拦截：回到桌面、显示提示并记录诊断数据。 */
+    /** 执行一次拦截：按当前方案退出目标应用、显示提示并记录诊断数据。 */
     private fun performInterception(nowMs: Long) {
-        val homeResult = performGlobalAction(GLOBAL_ACTION_HOME)
-        Logger.d(
-            "执行拦截：elapsedRealtime=$nowMs homeResult=$homeResult " +
-                "count=${interceptionStateMachine.interceptionCount}",
-        )
+        when (val exitAction = InterceptionActionPolicy.exitAction) {
+            ExitAction.BACK -> performBackInterception(nowMs)
+            ExitAction.HOME -> performHomeInterception(nowMs)
+        }
         InterceptionDiagnostics.record(nowMs)
         interceptionOverlay.show(getString(R.string.interception_message))
+    }
+
+    /**
+     * BACK 方案（M0.3-plus 最终版）：单次 `GLOBAL_ACTION_BACK`。
+     *
+     * 真机四轮实验结论：BACK 退出豆包过程中系统会产生非目标过渡窗口事件提前重置状态机，
+     * 因此任何"依赖抑制态做第二下校验"或"离开去抖"的方案都会漏退；固定两下则会误退
+     * 返回栈相邻应用。豆包实际需要两下返回退出（与手势一致），第二下由过渡重置后
+     * 豆包回前台事件触发的新拦截提供（计数 +2 为已接受边界，多发的一次 BACK 作用于
+     * 桌面无副作用）。冷启动期间 BACK 无效时由 3 秒抑制超时兜底。
+     */
+    private fun performBackInterception(nowMs: Long) {
+        val result = performGlobalAction(GLOBAL_ACTION_BACK)
+        Logger.d(
+            "执行拦截（BACK 单次）：elapsedRealtime=$nowMs result=$result " +
+                "count=${interceptionStateMachine.interceptionCount}",
+        )
+    }
+
+    /** HOME 方案（M0.3 已验收）：直接回到桌面，保留作对比与回归。 */
+    private fun performHomeInterception(nowMs: Long) {
+        val homeResult = performGlobalAction(GLOBAL_ACTION_HOME)
+        Logger.d(
+            "执行拦截（HOME）：elapsedRealtime=$nowMs homeResult=$homeResult " +
+                "count=${interceptionStateMachine.interceptionCount}",
+        )
     }
 
     private fun decisionName(decision: InterceptionDecision): String {
