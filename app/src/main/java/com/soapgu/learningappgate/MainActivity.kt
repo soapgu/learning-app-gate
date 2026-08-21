@@ -35,6 +35,9 @@ import com.soapgu.learningappgate.accessibility.ExitAction
 import com.soapgu.learningappgate.accessibility.GateAccessibilityService
 import com.soapgu.learningappgate.accessibility.InterceptionActionPolicy
 import com.soapgu.learningappgate.accessibility.InterceptionDiagnostics
+import com.soapgu.learningappgate.authorization.AuthorizationCenter
+import com.soapgu.learningappgate.authorization.LaunchAuthorizationStateMachine
+import com.soapgu.learningappgate.authorization.LaunchAuthorizationState
 import com.soapgu.learningappgate.target.TargetApp
 import com.soapgu.learningappgate.target.TargetAppLaunchResult
 import com.soapgu.learningappgate.target.TargetAppLauncher
@@ -43,10 +46,11 @@ import com.soapgu.learningappgate.target.TargetApps
 import com.soapgu.learningappgate.ui.theme.LearningAppGateTheme
 
 /**
- * M0 阶段的诊断主页。
+ * M0 阶段的诊断主页；M0.4 起提供“授权并启动豆包”入口。
  *
- * 当前页面只展示目标应用和无障碍服务状态，并提供启动目标应用、打开系统设置的入口；
- * 授权、计时和拦截逻辑会在后续里程碑中实现。
+ * 授权流程：解析成功 -> 创建 Pending 授权（5 秒有效）-> 发送官方启动 Intent；
+ * 豆包进入前台后由无障碍事件驱动激活，启动失败则立即撤销授权并显示错误。
+ * 直接启动豆包（未经授权）仍由守卫按 M0.3-plus 拦截。
  */
 class MainActivity : ComponentActivity() {
     private lateinit var targetAppLauncher: TargetAppLauncher
@@ -56,6 +60,7 @@ class MainActivity : ComponentActivity() {
     private var interceptionCount by mutableStateOf(0)
     private var lastInterceptionSeconds by mutableStateOf<Long?>(null)
     private var exitAction by mutableStateOf(InterceptionActionPolicy.exitAction)
+    private var authorizationState by mutableStateOf<LaunchAuthorizationState>(LaunchAuthorizationState.Idle)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -72,8 +77,9 @@ class MainActivity : ComponentActivity() {
                     lastInterceptionSeconds = lastInterceptionSeconds,
                     exitAction = exitAction,
                     onExitActionChange = ::selectExitAction,
+                    authorizationState = authorizationState,
                     launchMessage = launchMessage,
-                    onLaunch = ::launchTargetApp,
+                    onLaunch = ::authorizeAndLaunchTargetApp,
                     onOpenAccessibilitySettings = ::openAccessibilitySettings,
                 )
             }
@@ -97,6 +103,8 @@ class MainActivity : ComponentActivity() {
         lastInterceptionSeconds = InterceptionDiagnostics.lastInterceptionAtMs
             ?.let { (SystemClock.elapsedRealtime() - it) / 1000 }
         exitAction = InterceptionActionPolicy.exitAction
+        // 读取快照会做惰性超时判定：过期的 Pending 直接显示为已失效。
+        authorizationState = AuthorizationCenter.state
     }
 
     private fun selectExitAction(action: ExitAction) {
@@ -104,16 +112,50 @@ class MainActivity : ComponentActivity() {
         exitAction = action
     }
 
-    private fun launchTargetApp() {
+    /**
+     * 授权并启动目标应用（M0.4）：
+     * 解析失败 -> 显示错误且不创建授权；成功 -> 创建 Pending -> 启动；
+     * 启动异常 -> 立即撤销授权并显示错误，不留悬挂 Pending。
+     */
+    private fun authorizeAndLaunchTargetApp() {
+        // 解析先行：未安装/无启动入口直接报错，不进入授权流程。
+        when (val resolution = targetAppLauncher.resolve(TargetApps.DOUBAO)) {
+            TargetAppResolution.NotInstalled -> {
+                launchMessage = getString(R.string.target_not_installed)
+                return
+            }
+            TargetAppResolution.NoLaunchActivity -> {
+                launchMessage = getString(R.string.target_no_launch_activity)
+                return
+            }
+            is TargetAppResolution.Available -> Unit
+        }
+
+        if (!AuthorizationCenter.createPending()) {
+            launchMessage = getString(R.string.authorize_pending_exists)
+            return
+        }
+
         launchMessage = when (val result = targetAppLauncher.launch(TargetApps.DOUBAO)) {
             is TargetAppLaunchResult.Started -> getString(
-                R.string.launch_succeeded,
+                R.string.launch_authorized_started,
                 result.componentName.flattenToShortString(),
             )
-            TargetAppLaunchResult.NotInstalled -> getString(R.string.target_not_installed)
-            TargetAppLaunchResult.NoLaunchActivity -> getString(R.string.target_no_launch_activity)
-            is TargetAppLaunchResult.Failed -> getString(R.string.launch_failed, result.reason)
+            // 以下启动失败路径统一撤销刚创建的 Pending，避免 5 秒内悬挂。
+            TargetAppLaunchResult.NotInstalled -> {
+                AuthorizationCenter.revoke("目标应用未安装")
+                getString(R.string.target_not_installed)
+            }
+            TargetAppLaunchResult.NoLaunchActivity -> {
+                AuthorizationCenter.revoke("目标应用没有启动入口")
+                getString(R.string.target_no_launch_activity)
+            }
+            is TargetAppLaunchResult.Failed -> {
+                AuthorizationCenter.revoke("启动失败：${result.reason}")
+                getString(R.string.launch_failed, result.reason)
+            }
         }
+        authorizationState = AuthorizationCenter.state
     }
 
     private fun openAccessibilitySettings() {
@@ -133,6 +175,7 @@ fun MainScreen(
     lastInterceptionSeconds: Long?,
     exitAction: ExitAction,
     onExitActionChange: (ExitAction) -> Unit,
+    authorizationState: LaunchAuthorizationState,
     launchMessage: String?,
     onLaunch: () -> Unit,
     onOpenAccessibilitySettings: () -> Unit,
@@ -148,6 +191,7 @@ fun MainScreen(
             lastInterceptionSeconds = lastInterceptionSeconds,
             exitAction = exitAction,
             onExitActionChange = onExitActionChange,
+            authorizationState = authorizationState,
             launchMessage = launchMessage,
             onLaunch = onLaunch,
             onOpenAccessibilitySettings = onOpenAccessibilitySettings,
@@ -165,6 +209,7 @@ private fun MainContent(
     lastInterceptionSeconds: Long?,
     exitAction: ExitAction,
     onExitActionChange: (ExitAction) -> Unit,
+    authorizationState: LaunchAuthorizationState,
     launchMessage: String?,
     onLaunch: () -> Unit,
     onOpenAccessibilitySettings: () -> Unit,
@@ -239,8 +284,16 @@ private fun MainContent(
             onClick = onLaunch,
             enabled = resolution is TargetAppResolution.Available,
         ) {
-            Text(stringResource(R.string.launch_target, targetApp.displayName))
+            Text(stringResource(R.string.launch_authorized, targetApp.displayName))
         }
+        Spacer(modifier = Modifier.height(8.dp))
+        Text(
+            text = stringResource(
+                R.string.authorization_status_label,
+                authorizationStateDescription(authorizationState),
+            ),
+            style = MaterialTheme.typography.bodyMedium,
+        )
         launchMessage?.let { message ->
             Spacer(modifier = Modifier.height(16.dp))
             Text(
@@ -248,6 +301,21 @@ private fun MainContent(
                 style = MaterialTheme.typography.bodyMedium,
             )
         }
+    }
+}
+
+/** 授权状态的界面文案；失效原因对用户简化为统一“已结束”（完整原因见诊断日志）。 */
+@Composable
+private fun authorizationStateDescription(state: LaunchAuthorizationState): String {
+    return when (state) {
+        LaunchAuthorizationState.Idle -> stringResource(R.string.authorization_state_idle)
+        is LaunchAuthorizationState.Pending -> stringResource(
+            R.string.authorization_state_pending,
+            LaunchAuthorizationStateMachine.PENDING_VALIDITY_MS.toInt() / 1000,
+        )
+        is LaunchAuthorizationState.Active -> stringResource(R.string.authorization_state_active)
+        LaunchAuthorizationState.Paused -> stringResource(R.string.authorization_state_idle)
+        is LaunchAuthorizationState.Revoked -> stringResource(R.string.authorization_state_revoked)
     }
 }
 
@@ -282,6 +350,7 @@ private fun MainScreenPreview() {
             lastInterceptionSeconds = null,
             exitAction = ExitAction.BACK,
             onExitActionChange = {},
+            authorizationState = LaunchAuthorizationState.Idle,
             launchMessage = null,
             onLaunch = {},
             onOpenAccessibilitySettings = {},

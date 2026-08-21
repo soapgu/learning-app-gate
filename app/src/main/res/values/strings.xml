@@ -8,6 +8,14 @@
     <string name="launch_target">启动%1$s</string>
     <string name="launch_succeeded">已启动：%1$s</string>
     <string name="launch_failed">启动失败：%1$s</string>
+    <string name="launch_authorized">授权并启动%1$s</string>
+    <string name="launch_authorized_started">已授权启动：%1$s</string>
+    <string name="authorize_pending_exists">已有授权进行中，请稍候</string>
+    <string name="authorization_status_label">授权状态：%1$s</string>
+    <string name="authorization_state_idle">无授权</string>
+    <string name="authorization_state_pending">等待豆包进入前台（%1$d 秒内有效）</string>
+    <string name="authorization_state_active">已授权（豆包使用中，退出后失效）</string>
+    <string name="authorization_state_revoked">已结束</string>
     <string name="accessibility_service_name">豆包访问守卫</string>
     <string name="accessibility_service_description">观察目标应用进入和离开前台；在未经守卫授权时让设备返回桌面并显示提示，不读取页面内容。</string>
     <string name="accessibility_enabled">无障碍服务：已开启</string>
