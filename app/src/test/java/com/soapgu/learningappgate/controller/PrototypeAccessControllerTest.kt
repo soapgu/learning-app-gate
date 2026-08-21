@@ -8,10 +8,11 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * M0.5 控制器单元测试（纯 JVM：注入可控时钟与 fake 调度器）。
+ * M0.5/M0.6 控制器单元测试（纯 JVM：注入可控时钟与 fake 调度器）。
  *
- * 重点锁定 ROADMAP M0.5 验收：到期收回恰好一次（幂等）、定时器早触发重算不误收回、
- * 剩余时长恒非负、离开前台结算片段并取消计时、Revoked 终态不被旧任务重新激活。
+ * 重点锁定验收：到期收回恰好一次（幂等）、定时器早触发重算不误收回、
+ * 剩余时长恒非负、暂停取消计时/恢复按剩余重新起表、关屏暂停、
+ * 暂停期重置、多次快速暂停恢复后到期仍恰好收回一次。
  */
 class PrototypeAccessControllerTest {
 
@@ -136,20 +137,112 @@ class PrototypeAccessControllerTest {
     }
 
     @Test
-    fun onTargetLeftForeground_settlesSegmentCancelsAndRevokes() {
+    fun onTargetLeftForeground_pausesSettlesAndCancels_thenResumeReschedules() {
+        val h = Harness()
+        h.controller.onExpired = { h.expiredCount += 1 }
+        h.activate(totalMs = 30_000L, atMs = 2_000L)
+
+        // M0.6：离开前台不再失效，而是结算片段（消耗 10 秒）转 Paused 并取消到期任务。
+        h.nowMs = 12_000L
+        h.controller.onTargetLeftForeground()
+        val paused = h.controller.state as LaunchAuthorizationState.Paused
+        assertEquals(10_000L, paused.accumulatedForegroundMs)
+        assertEquals(20_000L, h.controller.remainingMs())
+        assertTrue(h.scheduler.isCancelled)
+        assertTrue(h.logs.any { it.contains("授权暂停（离开前台）：consumedForegroundMs=10000") })
+
+        // 暂停期到期的旧任务若仍被派发：非 Active，幂等无事可做。
+        h.nowMs = 40_000L
+        h.scheduler.fire()
+        assertEquals(0, h.expiredCount)
+        assertTrue(h.controller.state is LaunchAuthorizationState.Paused)
+
+        // 重新进入前台：从剩余 20 秒恢复，到期任务按剩余额度（非全额）重新起表。
+        h.nowMs = 60_000L
+        assertTrue(h.controller.onTargetForeground())
+        assertEquals(20_000L, h.scheduler.postedDelayMs)
+
+        // 恢复后按剩余额度到期收回（60s + 20s = 80s），恰好一次。
+        h.nowMs = 80_000L
+        h.scheduler.fire()
+        assertTrue(h.controller.state is LaunchAuthorizationState.Revoked)
+        assertEquals(1, h.expiredCount)
+    }
+
+    @Test
+    fun onScreenOff_pausesSettlesAndCancels() {
         val h = Harness()
         h.activate(totalMs = 30_000L, atMs = 2_000L)
 
-        // 豆包离开前台：结算当前片段（消耗 10 秒）写入诊断日志、取消到期任务、授权结束。
+        // 豆包在前台直接关屏：立即挂起计时（结算 6 秒），关屏期间不消耗额度。
+        h.nowMs = 8_000L
+        h.controller.onScreenOff()
+        val paused = h.controller.state as LaunchAuthorizationState.Paused
+        assertEquals(6_000L, paused.accumulatedForegroundMs)
+        assertTrue(h.scheduler.isCancelled)
+        assertTrue(h.logs.any { it.contains("授权暂停（关屏）") })
+
+        // 关屏很久后解锁回到豆包：从冻结的 24 秒继续。
+        h.nowMs = 100_000L
+        assertTrue(h.controller.onTargetForeground())
+        assertEquals(24_000L, h.scheduler.postedDelayMs)
+        assertEquals(24_000L, h.controller.remainingMs())
+    }
+
+    @Test
+    fun createPending_whilePaused_resetsOldQuota() {
+        val h = Harness()
+        h.activate(totalMs = 30_000L, atMs = 2_000L)
         h.nowMs = 12_000L
         h.controller.onTargetLeftForeground()
-        assertTrue(h.controller.state is LaunchAuthorizationState.Revoked)
-        assertTrue(h.scheduler.isCancelled)
-        assertTrue(h.logs.any { it.contains("授权片段结算：consumedForegroundMs=10000") })
 
-        // 再进豆包按未授权拦截。
-        h.nowMs = 13_000L
+        // 暂停期重置：旧额度作废，新授权生命周期独立。
+        h.nowMs = 60_000L
+        assertTrue(h.controller.createPending(totalMs = 600_000L))
+        assertEquals(
+            LaunchAuthorizationState.Pending(createdAtMs = 60_000L, totalMs = 600_000L),
+            h.controller.state,
+        )
+        assertTrue(h.logs.any { it.contains("重置，作废旧额度") })
+
+        // 新授权激活后按新额度起表（与旧授权的 20 秒剩余无关）。
+        h.nowMs = 61_000L
+        assertTrue(h.controller.onTargetForeground())
+        assertEquals(600_000L, h.scheduler.postedDelayMs)
+    }
+
+    @Test
+    fun rapidPauseResume_thenExpiry_recallsExactlyOnce() {
+        val h = Harness()
+        h.controller.onExpired = { h.expiredCount += 1 }
+        h.activate(totalMs = 30_000L, atMs = 1_000L)
+
+        // 多次快速暂停/恢复（验收：累计正确、转换唯一、无重复收回）。
+        h.nowMs = 3_000L
+        h.controller.onTargetLeftForeground()
+        h.nowMs = 10_000L
+        assertTrue(h.controller.onTargetForeground())
+        h.nowMs = 11_000L
+        h.controller.onScreenOff()
+        h.nowMs = 20_000L
+        assertTrue(h.controller.onTargetForeground())
+        h.nowMs = 24_000L
+        h.controller.onTargetLeftForeground()
+
+        // 前台累计 2+1+4=7 秒，剩余 23 秒；恢复后 23 秒到期。
+        h.nowMs = 30_000L
+        assertTrue(h.controller.onTargetForeground())
+        assertEquals(23_000L, h.scheduler.postedDelayMs)
+        h.nowMs = 53_000L
+        h.scheduler.fire()
+        assertTrue(h.controller.state is LaunchAuthorizationState.Revoked)
+        assertEquals(1, h.expiredCount)
+
+        // 收回后重放旧任务与再进豆包均不复活授权。
+        h.scheduler.fire()
+        h.nowMs = 54_000L
         assertFalse(h.controller.onTargetForeground())
+        assertEquals(1, h.expiredCount)
     }
 
     @Test
@@ -196,5 +289,17 @@ class PrototypeAccessControllerTest {
         // 额度超耗后剩余钳制为 0（验收：不出现负数时长）。
         h.nowMs = 200_000L
         assertEquals(0L, h.controller.remainingMs())
+    }
+
+    @Test
+    fun remainingMs_whilePaused_frozenAtSettledValue() {
+        val h = Harness()
+        h.activate(totalMs = 30_000L, atMs = 2_000L)
+
+        // 暂停期间剩余冻结，不随时间流逝扣减。
+        h.nowMs = 12_000L
+        h.controller.onTargetLeftForeground()
+        h.nowMs = 500_000L
+        assertEquals(20_000L, h.controller.remainingMs())
     }
 }

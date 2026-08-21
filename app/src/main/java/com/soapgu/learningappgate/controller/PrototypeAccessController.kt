@@ -46,12 +46,16 @@ class HandlerAccessScheduler(private val handler: Handler) : AccessScheduler {
 }
 
 /**
- * M0.5 前台计时与实时收回控制器：串行处理授权转换与到期计时，
- * 无障碍服务只上报前后台事件并执行拦截动作（服务注册 [onExpired] 回调）。
+ * M0.5/M0.6 前台计时与实时收回控制器：串行处理授权转换、到期计时与暂停恢复，
+ * 无障碍服务只上报前后台/屏幕事件并执行拦截动作（服务注册 [onExpired] 回调）。
  *
  * 到期流程（ROADMAP M0.5）：定时器触发时重算实际剩余时间；仍有剩余则
  * 重新调度（防定时器早触发/时钟漂移误收回），归零则先原子化转 Revoked，
  * 再在锁外触发 [onExpired]（BACK 拦截与提示由服务执行，避免锁内做系统动作）。
+ *
+ * 暂停恢复（ROADMAP M0.6）：豆包离开前台/关屏 -> Paused（结算片段、取消到期
+ * 任务，额度冻结）；豆包重新前台 -> 按剩余额度恢复计时。暂停无有效期；
+ * 暂停期 createPending = 重置（2026-08-21 用户决策）。
  *
  * 时钟与调度器由构造注入；生产环境使用 [prototypeAccessController] 单例。
  */
@@ -70,56 +74,53 @@ class PrototypeAccessController(
     @Volatile
     var onExpired: (() -> Unit)? = null
 
-    /** 创建待生效授权（守卫入口点击限时"授权并启动"）；已有有效授权时返回 false。 */
+    /** 创建待生效授权（守卫入口点击限时"授权并启动"）；已有 Pending/Active 授权时返回 false，Paused 态为重置（作废旧额度）。 */
     fun createPending(totalMs: Long): Boolean = synchronized(lock) {
         val nowMs = clock()
+        val before = stateMachine.state
         val created = stateMachine.createPending(nowMs, totalMs)
         log(
-            "授权状态：${if (created) "Idle/Revoked -> Pending(totalMs=$totalMs)" else "保持 ${stateMachine.state}（拒绝重复授权）"} elapsedRealtime=$nowMs",
+            when {
+                created && before is LaunchAuthorizationState.Paused ->
+                    "授权状态：$before -> Pending(totalMs=$totalMs)（重置，作废旧额度）"
+
+                created -> "授权状态：Idle/Revoked -> Pending(totalMs=$totalMs)"
+                else -> "授权状态：保持 ${stateMachine.state}（拒绝重复授权）"
+            } + " elapsedRealtime=$nowMs",
         )
         created
     }
 
-    /** 豆包前台事件：返回守卫是否放行；激活起表，额度耗尽时惰性收回。 */
+    /** 豆包前台事件：返回守卫是否放行；激活/恢复即按剩余额度起表，额度耗尽时惰性收回。 */
     fun onTargetForeground(): Boolean = synchronized(lock) {
         val nowMs = clock()
         val before = stateMachine.state
         val permitted = stateMachine.onTargetForeground(nowMs)
+        val after = stateMachine.state
         when {
-            before is LaunchAuthorizationState.Pending &&
-                stateMachine.state is LaunchAuthorizationState.Active -> {
-                // 激活即起表：按剩余额度调度一次到期任务。
-                val remainingMs = (stateMachine.state as LaunchAuthorizationState.Active).remainingMs(nowMs)
-                scheduler.postDelayed(remainingMs, ::handleExpiry)
+            // 激活（Pending -> Active）或恢复（Paused -> Active）即按剩余额度调度一次到期任务。
+            after is LaunchAuthorizationState.Active &&
+                (before is LaunchAuthorizationState.Pending || before is LaunchAuthorizationState.Paused) -> {
+                scheduler.postDelayed(after.remainingMs(nowMs), ::handleExpiry)
             }
 
-            before is LaunchAuthorizationState.Active && !permitted -> {
-                // 前台事件惰性兜底收回（定时器丢失场景）：清掉可能残留的到期任务。
-                scheduler.cancel()
-            }
+            // 未处于 Active（含惰性兜底收回）：确保无残留到期任务。
+            after !is LaunchAuthorizationState.Active -> scheduler.cancel()
         }
-        if (before != stateMachine.state || permitted) {
-            log("授权状态：$before -> ${stateMachine.state} permitted=$permitted elapsedRealtime=$nowMs")
+        if (before != after || permitted) {
+            log("授权状态：$before -> $after permitted=$permitted elapsedRealtime=$nowMs")
         }
         permitted
     }
 
-    /** 豆包离开前台：结算当前片段（诊断日志）并结束单次会话授权，取消到期任务。 */
-    fun onTargetLeftForeground() = synchronized(lock) {
-        val nowMs = clock()
-        val before = stateMachine.state
-        if (before is LaunchAuthorizationState.Active) {
-            val consumedMs = before.accumulatedForegroundMs + (nowMs - before.segmentStartAtMs)
-            log(
-                "授权片段结算：consumedForegroundMs=$consumedMs " +
-                    "remainingMs=${before.remainingMs(nowMs)} elapsedRealtime=$nowMs",
-            )
-            scheduler.cancel()
-        }
+    /** 豆包离开前台：结算当前片段并挂起计时（Active -> Paused），取消到期任务。 */
+    fun onTargetLeftForeground() = pauseAuthorization("离开前台") { nowMs ->
         stateMachine.onTargetLeftForeground(nowMs)
-        if (before != stateMachine.state) {
-            log("授权状态：$before -> ${stateMachine.state} elapsedRealtime=$nowMs")
-        }
+    }
+
+    /** 屏幕关闭（SCREEN_OFF 广播）：豆包可能仍在前台但不再有窗口事件，立即挂起计时。 */
+    fun onScreenOff() = pauseAuthorization("关屏") { nowMs ->
+        stateMachine.onScreenOff(nowMs)
     }
 
     /** 撤销授权（启动失败等场景）：取消到期任务。 */
@@ -151,11 +152,37 @@ class PrototypeAccessController(
             stateMachine.state
         }
 
-    /** 剩余额度（毫秒）；非 Active 态恒为 0，结构上非负。 */
+    /** 剩余额度（毫秒）；Active 按当前片段实时扣减，Paused 返回冻结值；其余态恒为 0。 */
     fun remainingMs(): Long = synchronized(lock) {
         val nowMs = clock()
         stateMachine.expireIfPendingTimeout(nowMs)
-        (stateMachine.state as? LaunchAuthorizationState.Active)?.remainingMs(nowMs) ?: 0L
+        when (val current = stateMachine.state) {
+            is LaunchAuthorizationState.Active -> current.remainingMs(nowMs)
+            is LaunchAuthorizationState.Paused -> current.remainingMs()
+            else -> 0L
+        }
+    }
+
+    /** 暂停共用逻辑：取消到期任务、驱动状态机转换、记录结算与状态变化日志。 */
+    private fun pauseAuthorization(cause: String, transition: (Long) -> Unit) {
+        synchronized(lock) {
+            val nowMs = clock()
+            val before = stateMachine.state
+            if (before is LaunchAuthorizationState.Active) {
+                scheduler.cancel()
+            }
+            transition(nowMs)
+            val after = stateMachine.state
+            if (after is LaunchAuthorizationState.Paused) {
+                log(
+                    "授权暂停（$cause）：consumedForegroundMs=${after.accumulatedForegroundMs} " +
+                        "remainingMs=${after.remainingMs()} elapsedRealtime=$nowMs",
+                )
+            }
+            if (before != after) {
+                log("授权状态：$before -> $after elapsedRealtime=$nowMs")
+            }
+        }
     }
 
     /**

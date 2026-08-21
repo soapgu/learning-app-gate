@@ -370,7 +370,11 @@ private fun authorizationStateDescription(
             // 向上取整：30 秒额度从激活即显示 30，而不是 29。
             ((remainingMs + 999L) / 1000L).toInt(),
         )
-        LaunchAuthorizationState.Paused -> stringResource(R.string.authorization_state_idle)
+        is LaunchAuthorizationState.Paused -> stringResource(
+            R.string.authorization_state_paused,
+            // 暂停期间额度冻结，剩余值即恢复后可用额度。
+            ((remainingMs + 999L) / 1000L).toInt(),
+        )
         is LaunchAuthorizationState.Revoked -> stringResource(R.string.authorization_state_revoked)
     }
 }

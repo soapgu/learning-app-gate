@@ -13,10 +13,11 @@
     <string name="authorization_status_label">授权状态：%1$s</string>
     <string name="authorization_state_idle">无授权</string>
     <string name="authorization_state_pending">等待豆包进入前台（%1$d 秒内有效）</string>
-    <string name="authorization_state_active">已授权（剩余 %1$d 秒，退出后失效）</string>
+    <string name="authorization_state_active">已授权（剩余 %1$d 秒）</string>
+    <string name="authorization_state_paused">已暂停（剩余 %1$d 秒，进入豆包继续）</string>
     <string name="authorization_state_revoked">已结束</string>
     <string name="accessibility_service_name">豆包访问守卫</string>
-    <string name="accessibility_service_description">观察目标应用进入和离开前台；在未经守卫授权时让设备返回桌面并显示提示，不读取页面内容。</string>
+    <string name="accessibility_service_description">观察目标应用进入和离开前台；在未经守卫授权时让设备返回桌面并显示提示。具备窗口信息读取能力，但仅读取窗口包名用于前后台与计时判定，不读取页面内容。</string>
     <string name="accessibility_enabled">无障碍服务：已开启</string>
     <string name="accessibility_disabled">无障碍服务：未开启</string>
     <string name="open_accessibility_settings">打开无障碍设置</string>

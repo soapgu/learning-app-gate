@@ -1,10 +1,11 @@
 package com.soapgu.learningappgate.authorization
 
 /**
- * M0.4/M0.5 临时授权的状态集合。
+ * M0.4/M0.5/M0.6 临时授权的状态集合。
  *
- * 生命周期为单次会话：授权激活期间豆包在前台不被拦截；豆包一旦真正离开前台
- * （自然退出、被杀、切换到其他应用），授权立即失效，再进入豆包按无授权拦截。
+ * M0.6 起生命周期为"额度制"：授权激活期间豆包在前台不被拦截；豆包离开前台或
+ * 关屏时转为 [Paused] 并挂起计时（不消耗额度），重新进入前台从剩余额度继续；
+ * 额度耗尽、启动失败或暂停期被重置时转为 [Revoked]，再进入豆包按无授权拦截。
  */
 sealed interface LaunchAuthorizationState {
     /** 无授权：豆包前台事件将被守卫按 M0.3-plus 拦截。 */
@@ -18,8 +19,8 @@ sealed interface LaunchAuthorizationState {
 
     /**
      * 已激活：豆包在前台，守卫放行；[totalMs] 为本档授权总额，
-     * [accumulatedForegroundMs] 与 [segmentStartAtMs] 为 M0.6 暂停恢复预埋的
-     * 累计前台时长与当前片段起点（M0.5 单片段，累计值恒为 0）。
+     * [accumulatedForegroundMs] 为已结算的累计前台时长，[segmentStartAtMs] 为
+     * 当前片段起点（恢复计时即开启新片段）。
      */
     data class Active(
         val activatedAtMs: Long,
@@ -35,24 +36,36 @@ sealed interface LaunchAuthorizationState {
     }
 
     /**
-     * 暂停（M0.6）：计时阶段豆包离开前台时授权暂停、计时挂起。
-     * M0.5 的单次会话语义不产生此状态（离开前台直接失效）。
+     * 已暂停（M0.6）：豆包离开前台或关屏时结算当前片段并挂起计时，
+     * 重新进入前台从剩余额度继续。暂停无有效期（2026-08-21 用户决策）；
+     * 暂停期再次创建授权 = 重置（作废旧额度）。
      */
-    data object Paused : LaunchAuthorizationState
+    data class Paused(
+        val totalMs: Long,
+        val accumulatedForegroundMs: Long,
+        val pausedAtMs: Long,
+    ) : LaunchAuthorizationState {
+        /** 剩余额度（毫秒）：暂停期间不消耗，结构上非负。 */
+        fun remainingMs(): Long = (totalMs - accumulatedForegroundMs).coerceAtLeast(0L)
+    }
 
     /** 已失效：携带失效原因，供界面展示与诊断日志使用。 */
     data class Revoked(val reason: String) : LaunchAuthorizationState
 }
 
 /**
- * M0.4/M0.5 临时授权状态机（纯逻辑，时钟由调用方传入，保证纯 JVM 可测）。
+ * M0.4/M0.5/M0.6 临时授权状态机（纯逻辑，时钟由调用方传入，保证纯 JVM 可测）。
  *
- * 转换规则（单次会话）：
- * - Idle --createPending--> Pending：仅守卫入口可触发，携带授权总额；Pending/Active 期间拒绝重复创建；
+ * 转换规则（额度制）：
+ * - Idle/Paused --createPending--> Pending：仅守卫入口可触发，携带授权总额；
+ *   Paused 期创建 = 重置（作废旧额度，2026-08-21 用户决策）；
+ *   Pending/Active 期间拒绝重复创建；
  * - Pending --豆包前台(未超时)--> Active：放行并起算额度；
  * - Pending --超时/启动失败--> Revoked：惰性判定，不引入定时器；
  * - Active --额度耗尽--> Revoked：定时器驱动（控制器）或前台事件惰性兜底；
- * - Active --豆包离开前台--> Revoked：授权单次会话结束，再进豆包即拦截；
+ * - Active --豆包离开前台/关屏--> Paused：结算当前片段并挂起计时；
+ * - Paused --豆包重新前台(剩余>0)--> Active：从剩余额度继续（新片段）；
+ * - Paused --重新前台(剩余<=0)--> Revoked：额度恰在切出瞬间耗尽的边界；
  * - 任意态 --revoke--> Revoked。
  *
  * Pending 有效期取 5 秒的依据：真机时序（2026-08-21 日志）显示守卫
@@ -71,7 +84,8 @@ class LaunchAuthorizationStateMachine {
      * 先做过期判定：已超时但尚未被事件惰性失效的 Pending 视同 Revoked，
      * 允许重新授权（否则豆包启动失败后用户停留在守卫页会被"进行中"卡住）。
      *
-     * @return 是否创建成功；已有未过期 Pending/Active 授权期间返回 false（拒绝重复授权）。
+     * @return 是否创建成功；Paused 态创建 = 重置旧授权并返回 true；
+     *   已有未过期 Pending/Active 授权期间返回 false（拒绝重复授权）。
      */
     fun createPending(nowMs: Long, totalMs: Long): Boolean {
         require(totalMs > 0) { "授权总额必须为正数：totalMs=$totalMs" }
@@ -82,10 +96,13 @@ class LaunchAuthorizationStateMachine {
                 true
             }
 
-            is LaunchAuthorizationState.Pending, is LaunchAuthorizationState.Active -> false
+            // 暂停期重置：守卫入口拥有最高控制权，旧额度直接作废（用户决策）。
+            is LaunchAuthorizationState.Paused -> {
+                state = LaunchAuthorizationState.Pending(nowMs, totalMs)
+                true
+            }
 
-            // M0.5 不产生 Paused；出现即编程错误，按拒绝处理并保持现状。
-            LaunchAuthorizationState.Paused -> false
+            is LaunchAuthorizationState.Pending, is LaunchAuthorizationState.Active -> false
         }
     }
 
@@ -93,8 +110,9 @@ class LaunchAuthorizationStateMachine {
      * 豆包前台事件到达时调用；返回守卫是否放行。
      *
      * Pending 未超时 -> 激活为 Active 并放行；Active 且额度未尽 -> 放行；
-     * Pending 已超时 / Active 额度耗尽 -> 惰性转 Revoked 并拒绝（定时器丢失时的
-     * 兜底，防额度穿透）；Idle/Revoked/Paused -> 拒绝。
+     * Paused 且剩余 > 0 -> 恢复为 Active（新片段）并放行；
+     * Pending 已超时 / Active 额度耗尽 / Paused 剩余耗尽 -> 惰性转 Revoked 并
+     * 拒绝（定时器丢失时的兜底，防额度穿透）；Idle/Revoked -> 拒绝。
      */
     fun onTargetForeground(nowMs: Long): Boolean {
         return when (val current = state) {
@@ -117,22 +135,42 @@ class LaunchAuthorizationStateMachine {
                 }
             }
 
-            LaunchAuthorizationState.Idle, is LaunchAuthorizationState.Revoked,
-            LaunchAuthorizationState.Paused,
-            -> false
+            is LaunchAuthorizationState.Paused -> {
+                if (current.remainingMs() > 0L) {
+                    state = LaunchAuthorizationState.Active(
+                        activatedAtMs = nowMs,
+                        totalMs = current.totalMs,
+                        accumulatedForegroundMs = current.accumulatedForegroundMs,
+                        segmentStartAtMs = nowMs,
+                    )
+                    true
+                } else {
+                    state = LaunchAuthorizationState.Revoked(TIME_EXPIRED_REASON)
+                    false
+                }
+            }
+
+            LaunchAuthorizationState.Idle, is LaunchAuthorizationState.Revoked -> false
         }
     }
 
     /**
      * 豆包离开前台时调用（非目标前台窗口事件）。
      *
-     * 单次会话语义：Active -> Revoked（本次授权结束）；
+     * Active -> Paused：结算当前片段并挂起计时（额度制，M0.6）；
      * Pending（启动过渡期，如荣耀广告页占前台）与其他状态不做处理。
      */
     fun onTargetLeftForeground(nowMs: Long) {
-        if (state is LaunchAuthorizationState.Active) {
-            state = LaunchAuthorizationState.Revoked("豆包已离开前台，本次授权结束")
-        }
+        pauseIfActive(nowMs)
+    }
+
+    /**
+     * 屏幕关闭时调用（SCREEN_OFF 广播）：豆包可能仍在前台但不再有窗口事件，
+     * 计时必须立即挂起，否则关屏期间额度持续消耗。
+     * Active -> Paused（结算当前片段）；其余状态不做处理。
+     */
+    fun onScreenOff(nowMs: Long) {
+        pauseIfActive(nowMs)
     }
 
     /** 撤销授权：任意状态 -> Revoked（启动失败、验收诊断等场景）。 */
@@ -152,6 +190,18 @@ class LaunchAuthorizationStateMachine {
             nowMs - current.createdAtMs > PENDING_VALIDITY_MS
         ) {
             state = LaunchAuthorizationState.Revoked("授权等待超时：豆包未在 ${PENDING_VALIDITY_MS / 1000} 秒内进入前台")
+        }
+    }
+
+    private fun pauseIfActive(nowMs: Long) {
+        val current = state
+        if (current is LaunchAuthorizationState.Active) {
+            val accumulated = current.accumulatedForegroundMs + (nowMs - current.segmentStartAtMs)
+            state = LaunchAuthorizationState.Paused(
+                totalMs = current.totalMs,
+                accumulatedForegroundMs = accumulated.coerceAtMost(current.totalMs),
+                pausedAtMs = nowMs,
+            )
         }
     }
 

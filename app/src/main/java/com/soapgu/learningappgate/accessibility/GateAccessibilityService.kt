@@ -1,6 +1,10 @@
 package com.soapgu.learningappgate.accessibility
 
 import android.accessibilityservice.AccessibilityService
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
@@ -8,17 +12,19 @@ import android.os.SystemClock
 import android.view.accessibility.AccessibilityEvent
 import com.orhanobut.logger.Logger
 import com.soapgu.learningappgate.R
+import com.soapgu.learningappgate.authorization.LaunchAuthorizationState
 import com.soapgu.learningappgate.controller.prototypeAccessController
 import com.soapgu.learningappgate.target.TargetApps
 
 /**
- * M0.3 的无障碍守卫服务；M0.5 起接入限时授权放行与到期收回。
+ * M0.3 的无障碍守卫服务；M0.5 起接入限时授权放行与到期收回，M0.6 起接入暂停恢复。
  *
  * 事件到达时驱动 [GateInterceptionStateMachine] 做防重入裁决；裁决为拦截时执行退出动作，
  * 覆盖层提示延迟到会话结束（观测到豆包真正离开前台）后显示，避免提示窗口自身的
  * TYPE_WINDOW_STATE_CHANGED 干扰状态机（2026-08-21 时序日志证实）。
- * 授权激活期间（[prototypeAccessController]）豆包前台事件直接放行；豆包离开前台即
- * 结束授权；额度到期由控制器回调，走与未授权拦截完全相同的 BACK 管线收回。
+ * 授权激活期间（[prototypeAccessController]）豆包前台事件直接放行；豆包离开前台或
+ * 关屏即挂起计时（Paused），重新前台从剩余额度继续；额度到期由控制器回调，走与
+ * 未授权拦截完全相同的 BACK 管线收回。
  * 服务自身不承载授权、计时等业务规则（由 PrototypeAccessController 接管）。
  */
 class GateAccessibilityService : AccessibilityService() {
@@ -32,6 +38,43 @@ class GateAccessibilityService : AccessibilityService() {
 
     /** 本会话最近一次豆包前台事件的 class；用于识别"页面被 BACK 回退"的 class 变化。 */
     private var lastTargetClassName: String? = null
+
+    /**
+     * M0.6 暂停仲裁：排队中的"活跃窗口过渡态"延迟复检（爆发式事件只排一次）。
+     * 豆包前台事件到达时作废（豆包窗口事件是前台的确定性证据，见 cancelPendingPauseRecheck）。
+     */
+    private var pauseRecheckPending = false
+    private var pauseRecheckRunnable: Runnable? = null
+
+    /** M0.6 屏幕事件接收器：关屏立即暂停计时；解锁后若豆包在前台则恢复（窗口事件缺失的兜底）。 */
+    private val screenEventReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            when (intent.action) {
+                Intent.ACTION_SCREEN_OFF -> {
+                    Logger.d("屏幕关闭：挂起计时 elapsedRealtime=${SystemClock.elapsedRealtime()}")
+                    prototypeAccessController.onScreenOff()
+                }
+
+                Intent.ACTION_USER_PRESENT -> {
+                    // 解锁本身不恢复计时（ROADMAP M0.6）；但解锁直接回到豆包时不保证
+                    // 有 TYPE_WINDOW_STATE_CHANGED 上报，若豆包确为活跃窗口则主动恢复，
+                    // 避免"豆包可用而额度暂停"的穿透。窗口事件正常到达时此调用为
+                    // 幂等 no-op（已 Active，放行）。
+                    val activePackage = rootInActiveWindow?.packageName
+                    if (prototypeAccessController.state is LaunchAuthorizationState.Paused &&
+                        TargetAppEventMatcher.matches(activePackage, TargetApps.DOUBAO)
+                    ) {
+                        Logger.d(
+                            "解锁且豆包在前台：恢复计时 activePackage=$activePackage " +
+                                "elapsedRealtime=${SystemClock.elapsedRealtime()}",
+                        )
+                        prototypeAccessController.onTargetForeground()
+                    }
+                }
+            }
+        }
+    }
+    private var screenEventReceiverRegistered = false
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -47,6 +90,12 @@ class GateAccessibilityService : AccessibilityService() {
                 performInterception(nowMs, getString(R.string.time_expired_message))
             }
         }
+        // M0.6 屏幕事件：SCREEN_OFF 无法 manifest 注册，只能动态注册（主线程）。
+        registerReceiver(screenEventReceiver, IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_USER_PRESENT)
+        })
+        screenEventReceiverRegistered = true
         Logger.d("服务已连接")
     }
 
@@ -63,8 +112,12 @@ class GateAccessibilityService : AccessibilityService() {
         val decision = when {
             // 目标前台事件（两种窗口事件均可触发，避免个别入口只上报其中一种）。
             isTarget -> {
-                // M0.5 限时授权放行查询先行：授权激活期间（守卫入口"授权并启动"）
+                // M0.6 限时授权放行查询先行：授权激活期间（守卫入口"授权并启动"）
                 // 豆包前台事件不进入拦截链路；豆包离开前台后授权立即失效。
+                // 豆包窗口事件本身是前台的确定性证据，作废排队中的暂停复检
+                //（2026-08-21 真机教训：启动过渡期排下的复检在激活后触发，
+                // 误杀刚激活 251ms 的授权，豆包前台 50 秒额度纹丝不动）。
+                cancelPendingPauseRecheck()
                 permitted = prototypeAccessController.onTargetForeground()
                 val className = event.className?.toString()
                 val targetDecision = if (permitted) {
@@ -107,9 +160,14 @@ class GateAccessibilityService : AccessibilityService() {
             // 非目标前台事件：说明豆包已实际离开前台，结束当前抑制会话。
             // 仅窗口状态变化可靠携带包名；windows 变化常无包名，不作为重置信号。
             event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
-                // M0.5 单次会话授权：豆包真正离开前台即结束授权
-                //（Pending 期不受影响，荣耀广告页等过渡事件不误伤待生效授权）。
-                prototypeAccessController.onTargetLeftForeground()
+                // M0.6 计时暂停仲裁（方案 A，2026-08-21 三轮真机迭代结论）：
+                // ① 不校验 root：荣耀桌面后台刷新噪音把计时反复误冻结（81 秒只记 4 秒）；
+                // ② root=null 一律忽略：canRetrieveWindowContent=false 时 root 恒为 null，
+                //   整个会话 0 次暂停、到期 BACK 连发误退守卫；
+                // ③ 最终：开启 canRetrieveWindowContent（仅读窗口包名，用户决策），
+                //   root 非空可信（豆包=忽略噪音，非豆包=立即暂停），null 过渡态延迟复检，
+                //   复检仍未解析按离开处理（宁严）；豆包前台事件作废排队中的复检。
+                handleNonTargetWindowState(event.packageName?.toString().orEmpty(), nowMs)
                 if (interceptionStateMachine.isSuppressing) {
                     finishInterceptionSession(event.packageName?.toString().orEmpty(), nowMs)
                 } else {
@@ -145,6 +203,10 @@ class GateAccessibilityService : AccessibilityService() {
     override fun onDestroy() {
         Logger.d("服务已销毁")
         mainHandler.removeCallbacksAndMessages(null)
+        if (screenEventReceiverRegistered) {
+            unregisterReceiver(screenEventReceiver)
+            screenEventReceiverRegistered = false
+        }
         // 注销到期回调并取消计时任务（授权状态保持不变，服务重连语义由 M0.7 验证）。
         prototypeAccessController.clearOnExpired()
         prototypeAccessController.cancelScheduledExpiry()
@@ -222,6 +284,82 @@ class GateAccessibilityService : AccessibilityService() {
     }
 
     /**
+     * M0.6 暂停仲裁：非目标窗口事件到达时判定豆包是否真正离开前台。
+     *
+     * rootInActiveWindow 非空时可信：豆包 -> 忽略（桌面后台刷新噪音）；
+     * 非豆包 -> 立即暂停。null（窗口切换瞬间的过渡态，恰是事件到达时刻）时
+     * 延迟 [PAUSE_RECHECK_DELAY_MS] 复检，过渡态结束后重新判定；复检仍未解析
+     * 则按离开处理（宁严方向，防计时穿透）。爆发式事件（真实切走约 1 秒内
+     * 多发）通过 [pauseRecheckPending] 去重，只排队一次复检。
+     */
+    private fun handleNonTargetWindowState(eventPackage: String, nowMs: Long) {
+        val activePackage = rootInActiveWindow?.packageName?.toString()
+        when {
+            activePackage != null &&
+                TargetAppEventMatcher.matches(activePackage, TargetApps.DOUBAO) ->
+                Logger.d(
+                    "忽略过渡窗口事件：豆包仍为活跃窗口 root=$activePackage " +
+                        "package=$eventPackage elapsedRealtime=$nowMs",
+                )
+
+            activePackage != null -> {
+                Logger.d(
+                    "豆包已离开前台：root=$activePackage package=$eventPackage " +
+                        "elapsedRealtime=$nowMs",
+                )
+                prototypeAccessController.onTargetLeftForeground()
+            }
+
+            !pauseRecheckPending -> {
+                pauseRecheckPending = true
+                Logger.d(
+                    "暂停判定排队复检：活跃窗口过渡态 package=$eventPackage " +
+                        "elapsedRealtime=$nowMs",
+                )
+                Runnable {
+                    pauseRecheckPending = false
+                    pauseRecheckRunnable = null
+                    recheckPauseArbitration(eventPackage)
+                }.also { runnable ->
+                    pauseRecheckRunnable = runnable
+                    mainHandler.postDelayed(runnable, PAUSE_RECHECK_DELAY_MS)
+                }
+            }
+
+            // 已有复检在排队：本次事件并入复检，不重复排队。
+            else -> Unit
+        }
+    }
+
+    /** 豆包前台事件到达：作废排队中的暂停复检（陈旧复检会误杀刚激活/恢复的计时）。 */
+    private fun cancelPendingPauseRecheck() {
+        if (pauseRecheckPending) {
+            pauseRecheckPending = false
+            pauseRecheckRunnable?.let(mainHandler::removeCallbacks)
+            pauseRecheckRunnable = null
+            Logger.d("作废暂停复检：豆包前台事件到达 elapsedRealtime=${SystemClock.elapsedRealtime()}")
+        }
+    }
+
+    /** 复检：重新读取活跃窗口；仍未解析（罕见）按离开处理，宁严防计时穿透。 */
+    private fun recheckPauseArbitration(eventPackage: String) {
+        val nowMs = SystemClock.elapsedRealtime()
+        val activePackage = rootInActiveWindow?.packageName?.toString()
+        if (activePackage != null && TargetAppEventMatcher.matches(activePackage, TargetApps.DOUBAO)) {
+            Logger.d(
+                "复检忽略：豆包仍为活跃窗口 root=$activePackage package=$eventPackage " +
+                    "elapsedRealtime=$nowMs",
+            )
+        } else {
+            Logger.d(
+                "复检暂停：root=${activePackage ?: "未解析"} package=$eventPackage " +
+                    "elapsedRealtime=$nowMs",
+            )
+            prototypeAccessController.onTargetLeftForeground()
+        }
+    }
+
+    /**
      * 补发前的活跃窗口校验：仅当活跃窗口已明确切换到其他应用（守卫/桌面）时才阻止补发。
      *
      * [rootInActiveWindow] 在窗口切换瞬间（恰是页面回退信号到达时）返回 null，
@@ -240,6 +378,10 @@ class GateAccessibilityService : AccessibilityService() {
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
             AccessibilityEvent.TYPE_WINDOWS_CHANGED,
         )
+
+        // M0.6 暂停仲裁的延迟复检间隔：窗口切换过渡态（rootInActiveWindow 为 null）
+        // 通常在数百毫秒内结束；复检过早会仍在过渡态，过晚会延迟暂停结算。
+        const val PAUSE_RECHECK_DELAY_MS = 300L
 
         // M0.3-plus 拦截提示开关：覆盖层在拦截瞬间显示会引发死循环（其窗口事件在
         // 抑制期内被当作"豆包已离开"重置状态机），现改为延迟到会话结束（豆包真正

@@ -6,10 +6,10 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * M0.4/M0.5 授权状态机单元测试（纯 JVM，时钟由测试传入）。
+ * M0.4/M0.5/M0.6 授权状态机单元测试（纯 JVM，时钟由测试传入）。
  *
- * 重点锁定单次会话语义与限时额度语义：Active 后豆包离开前台即失效；
- * 额度耗尽后（定时器或前台事件路径）再进豆包拒绝放行。
+ * 重点锁定额度制语义：离开前台/关屏暂停结算（不消耗额度）、重新前台从剩余继续、
+ * 额度耗尽收回、暂停期重置；多次快速切换后累计正确、状态转换唯一。
  */
 class LaunchAuthorizationStateMachineTest {
 
@@ -38,6 +38,19 @@ class LaunchAuthorizationStateMachineTest {
             LaunchAuthorizationState.Active(activatedAtMs = 2_000L, totalMs = 30_000L),
             machine.state,
         )
+    }
+
+    @Test
+    fun createPending_whilePaused_resetsOldQuota() {
+        val machine = machine()
+        machine.createPending(nowMs = 1_000L, totalMs = 30_000L)
+        assertTrue(machine.onTargetForeground(nowMs = 2_000L))
+        machine.onTargetLeftForeground(nowMs = 12_000L)
+        assertTrue(machine.state is LaunchAuthorizationState.Paused)
+
+        // 暂停期重置（2026-08-21 用户决策）：旧额度作废，直接创建新 Pending。
+        assertTrue(machine.createPending(nowMs = 60_000L, totalMs = 600_000L))
+        assertEquals(LaunchAuthorizationState.Pending(createdAtMs = 60_000L, totalMs = 600_000L), machine.state)
     }
 
     @Test
@@ -124,18 +137,44 @@ class LaunchAuthorizationStateMachineTest {
     }
 
     @Test
-    fun onTargetLeftForeground_afterActive_revokes() {
+    fun onTargetLeftForeground_afterActive_pausesWithSettlement() {
         val machine = machine()
-        machine.createPending(nowMs = 1_000L, totalMs = 600_000L)
+        machine.createPending(nowMs = 1_000L, totalMs = 30_000L)
         assertTrue(machine.onTargetForeground(nowMs = 2_000L))
 
-        // 单次会话核心：豆包离开前台（退出/被杀/切走）授权立即结束。
-        machine.onTargetLeftForeground(nowMs = 3_000L)
-        val revoked = machine.state
-        assertTrue(revoked is LaunchAuthorizationState.Revoked)
+        // M0.6：离开前台不再失效，而是结算当前片段（2s~12s 共 10 秒）转 Paused。
+        machine.onTargetLeftForeground(nowMs = 12_000L)
+        val paused = machine.state as LaunchAuthorizationState.Paused
+        assertEquals(10_000L, paused.accumulatedForegroundMs)
+        assertEquals(30_000L, paused.totalMs)
+        assertEquals(12_000L, paused.pausedAtMs)
+        assertEquals(20_000L, paused.remainingMs())
 
-        // 豆包被杀后再自己打开：授权已失效，拒绝放行 -> 拦截。
-        assertFalse(machine.onTargetForeground(nowMs = 5_000L))
+        // 重新进入前台：从剩余 20 秒继续（新片段，累计值保留）。
+        assertTrue(machine.onTargetForeground(nowMs = 60_000L))
+        val resumed = machine.state as LaunchAuthorizationState.Active
+        assertEquals(10_000L, resumed.accumulatedForegroundMs)
+        assertEquals(60_000L, resumed.segmentStartAtMs)
+        assertEquals(20_000L, resumed.remainingMs(nowMs = 60_000L))
+        assertEquals(10_000L, resumed.remainingMs(nowMs = 70_000L))
+    }
+
+    @Test
+    fun rapidSwitching_accumulatesOnlyForegroundTime() {
+        val machine = machine()
+        machine.createPending(nowMs = 0L, totalMs = 30_000L)
+        assertTrue(machine.onTargetForeground(nowMs = 1_000L))
+
+        // 多次快速切换（验收：累计时间只含前台片段，状态转换唯一）。
+        machine.onTargetLeftForeground(nowMs = 3_000L)                      // 片段 1：2 秒
+        assertTrue(machine.onTargetForeground(nowMs = 10_000L))
+        machine.onTargetLeftForeground(nowMs = 11_000L)                     // 片段 2：1 秒
+        assertTrue(machine.onTargetForeground(nowMs = 20_000L))
+        machine.onTargetLeftForeground(nowMs = 24_000L)                     // 片段 3：4 秒
+
+        val paused = machine.state as LaunchAuthorizationState.Paused
+        assertEquals(7_000L, paused.accumulatedForegroundMs)
+        assertEquals(23_000L, paused.remainingMs())
     }
 
     @Test
@@ -153,16 +192,72 @@ class LaunchAuthorizationStateMachineTest {
     }
 
     @Test
-    fun onTargetLeftForeground_inIdleOrRevoked_isNoOp() {
+    fun onTargetLeftForeground_inIdleOrPausedOrRevoked_isNoOp() {
         val machine = machine()
 
         machine.onTargetLeftForeground(nowMs = 1_000L)
         assertEquals(LaunchAuthorizationState.Idle, machine.state)
 
+        // 已暂停：再次非目标事件（其他应用继续切换）不得改变暂停态或额度。
         machine.createPending(nowMs = 1_000L, totalMs = 30_000L)
+        machine.onTargetForeground(nowMs = 2_000L)
+        machine.onTargetLeftForeground(nowMs = 4_000L)
+        machine.onTargetLeftForeground(nowMs = 9_000L)
+        val paused = machine.state as LaunchAuthorizationState.Paused
+        assertEquals(2_000L, paused.accumulatedForegroundMs)
+
         machine.revoke("测试撤销")
-        machine.onTargetLeftForeground(nowMs = 2_000L)
+        machine.onTargetLeftForeground(nowMs = 10_000L)
         assertTrue(machine.state is LaunchAuthorizationState.Revoked)
+    }
+
+    @Test
+    fun onScreenOff_whileActive_pausesWithSettlement() {
+        val machine = machine()
+        machine.createPending(nowMs = 1_000L, totalMs = 30_000L)
+        assertTrue(machine.onTargetForeground(nowMs = 2_000L))
+
+        // 豆包在前台直接关屏：结算片段转 Paused（关屏期间不消耗额度）。
+        machine.onScreenOff(nowMs = 8_000L)
+        val paused = machine.state as LaunchAuthorizationState.Paused
+        assertEquals(6_000L, paused.accumulatedForegroundMs)
+        assertEquals(24_000L, paused.remainingMs())
+
+        // 解锁回到豆包：从剩余 24 秒继续。
+        assertTrue(machine.onTargetForeground(nowMs = 60_000L))
+        assertEquals(24_000L, (machine.state as LaunchAuthorizationState.Active).remainingMs(nowMs = 60_000L))
+    }
+
+    @Test
+    fun onScreenOff_whilePendingOrPausedOrIdle_isNoOp() {
+        val machine = machine()
+
+        machine.onScreenOff(nowMs = 1_000L)
+        assertEquals(LaunchAuthorizationState.Idle, machine.state)
+
+        machine.createPending(nowMs = 1_000L, totalMs = 30_000L)
+        machine.onScreenOff(nowMs = 2_000L)
+        assertEquals(LaunchAuthorizationState.Pending(createdAtMs = 1_000L, totalMs = 30_000L), machine.state)
+
+        machine.onTargetForeground(nowMs = 3_000L)
+        machine.onScreenOff(nowMs = 5_000L)
+        machine.onScreenOff(nowMs = 9_000L)
+        val paused = machine.state as LaunchAuthorizationState.Paused
+        assertEquals(2_000L, paused.accumulatedForegroundMs)
+    }
+
+    @Test
+    fun onTargetForeground_pausedWithZeroRemaining_revokesAndRejects() {
+        val machine = machine()
+        machine.createPending(nowMs = 0L, totalMs = 10_000L)
+        assertTrue(machine.onTargetForeground(nowMs = 1_000L))
+
+        // 额度恰在切出瞬间耗尽（1s~11s 恰好用满 10 秒）：暂停后剩余为 0，
+        // 再进豆包直接收回并拒绝（走未授权拦截链路）。
+        machine.onTargetLeftForeground(nowMs = 11_000L)
+        assertFalse(machine.onTargetForeground(nowMs = 50_000L))
+        val revoked = machine.state as LaunchAuthorizationState.Revoked
+        assertEquals(LaunchAuthorizationStateMachine.TIME_EXPIRED_REASON, revoked.reason)
     }
 
     @Test
@@ -176,6 +271,15 @@ class LaunchAuthorizationStateMachineTest {
 
         // Revoked 后豆包事件拒绝放行。
         assertFalse(machine.onTargetForeground(nowMs = 2_000L))
+
+        // Paused 态撤销同样直达 Revoked。
+        val pausedMachine = machine()
+        pausedMachine.createPending(nowMs = 1_000L, totalMs = 30_000L)
+        pausedMachine.onTargetForeground(nowMs = 2_000L)
+        pausedMachine.onTargetLeftForeground(nowMs = 4_000L)
+        pausedMachine.revoke("验收诊断")
+        assertTrue(pausedMachine.state is LaunchAuthorizationState.Revoked)
+        assertFalse(pausedMachine.onTargetForeground(nowMs = 5_000L))
     }
 
     @Test
