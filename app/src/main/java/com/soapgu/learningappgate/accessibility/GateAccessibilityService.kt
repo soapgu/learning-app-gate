@@ -8,17 +8,18 @@ import android.os.SystemClock
 import android.view.accessibility.AccessibilityEvent
 import com.orhanobut.logger.Logger
 import com.soapgu.learningappgate.R
-import com.soapgu.learningappgate.authorization.AuthorizationCenter
+import com.soapgu.learningappgate.controller.prototypeAccessController
 import com.soapgu.learningappgate.target.TargetApps
 
 /**
- * M0.3 的无障碍守卫服务；M0.4 起接入临时授权放行。
+ * M0.3 的无障碍守卫服务；M0.5 起接入限时授权放行与到期收回。
  *
  * 事件到达时驱动 [GateInterceptionStateMachine] 做防重入裁决；裁决为拦截时执行退出动作，
  * 覆盖层提示延迟到会话结束（观测到豆包真正离开前台）后显示，避免提示窗口自身的
  * TYPE_WINDOW_STATE_CHANGED 干扰状态机（2026-08-21 时序日志证实）。
- * 授权激活期间（[AuthorizationCenter]）豆包前台事件直接放行；豆包离开前台即结束授权。
- * 服务自身不承载授权、计时等业务规则（M0.5 由 PrototypeAccessController 接管）。
+ * 授权激活期间（[prototypeAccessController]）豆包前台事件直接放行；豆包离开前台即
+ * 结束授权；额度到期由控制器回调，走与未授权拦截完全相同的 BACK 管线收回。
+ * 服务自身不承载授权、计时等业务规则（由 PrototypeAccessController 接管）。
  */
 class GateAccessibilityService : AccessibilityService() {
     private val powerManager by lazy { getSystemService(PowerManager::class.java) }
@@ -26,8 +27,8 @@ class GateAccessibilityService : AccessibilityService() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private lateinit var interceptionOverlay: InterceptionOverlay
 
-    /** 本会话待显示的拦截提示；会话结束时（豆包真正离开前台）显示并清除。 */
-    private var pendingOverlayNotice = false
+    /** 本会话待显示的拦截提示（null 表示无）；会话结束时（豆包真正离开前台）显示并清除。 */
+    private var pendingOverlayNoticeMessage: String? = null
 
     /** 本会话最近一次豆包前台事件的 class；用于识别"页面被 BACK 回退"的 class 变化。 */
     private var lastTargetClassName: String? = null
@@ -37,6 +38,15 @@ class GateAccessibilityService : AccessibilityService() {
         // TYPE_ACCESSIBILITY_OVERLAY 窗口由已绑定的无障碍服务直接创建即可，无需额外 flag
         //（与官方 GlobalActionBarService 示例一致）。
         interceptionOverlay = InterceptionOverlay(this)
+        // 到期收回（M0.5）：控制器已原子化转 Revoked 后回调；走与未授权拦截相同的
+        // 拦截状态机（进入抑制态）与 BACK 管线，后续 class 变化由精准补发兜底，
+        // 豆包由守卫入口启动，BACK 会自然退回守卫 App（用户决策，替代原定 HOME）。
+        prototypeAccessController.onExpired = {
+            val nowMs = SystemClock.elapsedRealtime()
+            if (interceptionStateMachine.onTargetForeground(nowMs) == InterceptionDecision.Intercept) {
+                performInterception(nowMs, getString(R.string.time_expired_message))
+            }
+        }
         Logger.d("服务已连接")
     }
 
@@ -53,17 +63,16 @@ class GateAccessibilityService : AccessibilityService() {
         val decision = when {
             // 目标前台事件（两种窗口事件均可触发，避免个别入口只上报其中一种）。
             isTarget -> {
-                // M0.4 授权放行查询先行：授权激活期间（守卫入口"授权并启动"）
+                // M0.5 限时授权放行查询先行：授权激活期间（守卫入口"授权并启动"）
                 // 豆包前台事件不进入拦截链路；豆包离开前台后授权立即失效。
-                permitted = AuthorizationCenter.onTargetForeground()
-                if (permitted) {
-                    // 放行期间不维护拦截状态机与 class 记忆：授权结束后的
-                    // 拦截会话自行学习首见 class（首见事件跳过补发比较）。
+                permitted = prototypeAccessController.onTargetForeground()
+                val className = event.className?.toString()
+                val targetDecision = if (permitted) {
+                    // 放行期间不驱动拦截状态机（decision 为 null）。
                     null
                 } else {
                     // 先识别 class 变化：抑制期内豆包 class 变化说明第一发 BACK 被用于
                     // 页面回退（如 MainActivity -> DrawerLayout），是精准补发第二发的信号。
-                    val className = event.className?.toString()
                     val previousClassName = lastTargetClassName
                     if (previousClassName != null && className != previousClassName) {
                         if (!isForegroundStillTarget()) {
@@ -84,17 +93,23 @@ class GateAccessibilityService : AccessibilityService() {
                             performGlobalAction(GLOBAL_ACTION_BACK)
                         }
                     }
-                    lastTargetClassName = className
                     interceptionStateMachine.onTargetForeground(nowMs)
                 }
+                // 放行与拦截路径统一维护 class 记忆：M0.5 到期收回发生在豆包仍处于前台时，
+                // 精准补发依赖"拦截前基线 -> 拦截后 class 变化"的连续性（2026-08-21 真机日志：
+                // 不维护基线导致到期只发一发 BACK，退出失败）。
+                // 必须放在上面的比较之后：若提前覆盖基线，className == lastTargetClassName
+                // 恒成立，精准补发永远不触发。
+                lastTargetClassName = className
+                targetDecision
             }
 
             // 非目标前台事件：说明豆包已实际离开前台，结束当前抑制会话。
             // 仅窗口状态变化可靠携带包名；windows 变化常无包名，不作为重置信号。
             event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
-                // M0.4 单次会话授权：豆包真正离开前台即结束授权
+                // M0.5 单次会话授权：豆包真正离开前台即结束授权
                 //（Pending 期不受影响，荣耀广告页等过渡事件不误伤待生效授权）。
-                AuthorizationCenter.onTargetLeftForeground()
+                prototypeAccessController.onTargetLeftForeground()
                 if (interceptionStateMachine.isSuppressing) {
                     finishInterceptionSession(event.packageName?.toString().orEmpty(), nowMs)
                 } else {
@@ -107,7 +122,7 @@ class GateAccessibilityService : AccessibilityService() {
         }
 
         if (decision == InterceptionDecision.Intercept) {
-            performInterception(nowMs)
+            performInterception(nowMs, getString(R.string.interception_message))
         }
 
         val packageName = event.packageName?.toString().orEmpty()
@@ -130,20 +145,26 @@ class GateAccessibilityService : AccessibilityService() {
     override fun onDestroy() {
         Logger.d("服务已销毁")
         mainHandler.removeCallbacksAndMessages(null)
+        // 注销到期回调并取消计时任务（授权状态保持不变，服务重连语义由 M0.7 验证）。
+        prototypeAccessController.clearOnExpired()
+        prototypeAccessController.cancelScheduledExpiry()
         if (::interceptionOverlay.isInitialized) {
             interceptionOverlay.hide()
         }
         super.onDestroy()
     }
 
-    /** 执行一次拦截：按当前方案退出目标应用并记录诊断数据；提示延迟到会话结束显示。 */
-    private fun performInterception(nowMs: Long) {
+    /**
+     * 执行一次拦截：按当前方案退出目标应用并记录诊断数据；提示延迟到会话结束显示。
+     * [noticeMessage] 为延迟提示的文案（未授权拦截与额度到期收回各有专属提示）。
+     */
+    private fun performInterception(nowMs: Long, noticeMessage: String) {
         when (val exitAction = InterceptionActionPolicy.exitAction) {
             ExitAction.BACK -> performBackInterception(nowMs)
             ExitAction.HOME -> performHomeInterception(nowMs)
         }
         InterceptionDiagnostics.record(nowMs)
-        pendingOverlayNotice = true
+        pendingOverlayNoticeMessage = noticeMessage
     }
 
     /**
@@ -156,11 +177,11 @@ class GateAccessibilityService : AccessibilityService() {
             "会话结束：豆包已离开前台，当前前台=$currentForegroundPackage " +
                 "elapsedRealtime=$nowMs",
         )
-        if (pendingOverlayNotice) {
-            pendingOverlayNotice = false
+        pendingOverlayNoticeMessage?.let { message ->
+            pendingOverlayNoticeMessage = null
             if (ENABLE_OVERLAY_PROMPT) {
                 Logger.d("显示拦截提示（延迟至会话结束）：elapsedRealtime=$nowMs")
-                interceptionOverlay.show(getString(R.string.interception_message))
+                interceptionOverlay.show(message)
             } else {
                 // 2026-08-22 真机验证结论：覆盖层窗口事件是拦截死循环的必要环节，
                 // 用户确认 M0.3-plus 不恢复覆盖层提示（BACK 退出后直接回守卫即可）。
