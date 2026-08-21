@@ -84,13 +84,30 @@ class GateAccessibilityService : AccessibilityService() {
         // 到期收回（M0.5）：控制器已原子化转 Revoked 后回调；走与未授权拦截相同的
         // 拦截状态机（进入抑制态）与 BACK 管线，后续 class 变化由精准补发兜底，
         // 豆包由守卫入口启动，BACK 会自然退回守卫 App（用户决策，替代原定 HOME）。
+        // 到期收回（M0.5）：控制器已原子化转 Revoked 后回调；走与未授权拦截相同的
+        // 拦截状态机（进入抑制态）与 BACK 管线，后续 class 变化由精准补发兜底，
+        // 豆包由守卫入口启动，BACK 会自然退回守卫 App（用户决策，替代原定 HOME）。
+        // M0.7 到期保护：到期瞬间用户可能已切走豆包，此时 BACK 会打到当前前台
+        //（2026-08-21 真机实测：到期时守卫/launcher 在前台被连发 3 次 BACK 退出）；
+        // 活跃窗口已非豆包则跳过拦截（授权已收回，守卫页可见"已结束"）。
         prototypeAccessController.onExpired = {
             val nowMs = SystemClock.elapsedRealtime()
-            if (interceptionStateMachine.onTargetForeground(nowMs) == InterceptionDecision.Intercept) {
+            if (!isForegroundStillTarget()) {
+                Logger.d(
+                    "到期时豆包已不在前台：跳过拦截 " +
+                        "active=${rootInActiveWindow?.packageName} elapsedRealtime=$nowMs",
+                )
+            } else if (interceptionStateMachine.onTargetForeground(nowMs) == InterceptionDecision.Intercept) {
                 performInterception(nowMs, getString(R.string.time_expired_message))
             }
         }
-        // M0.6 屏幕事件：SCREEN_OFF 无法 manifest 注册，只能动态注册（主线程）。
+        // M0.7 服务重连自愈：授权仍 Active 时按剩余额度补排到期任务。
+        prototypeAccessController.ensureExpiryScheduled()
+        // M0.6 屏幕事件：SCREEN_OFF 无法 manifest 注册，只能动态注册（主线程）；
+        // 部分重复回调 onServiceConnected 的 ROM 需先注销防泄漏。
+        if (screenEventReceiverRegistered) {
+            unregisterReceiver(screenEventReceiver)
+        }
         registerReceiver(screenEventReceiver, IntentFilter().apply {
             addAction(Intent.ACTION_SCREEN_OFF)
             addAction(Intent.ACTION_USER_PRESENT)
@@ -207,9 +224,11 @@ class GateAccessibilityService : AccessibilityService() {
             unregisterReceiver(screenEventReceiver)
             screenEventReceiverRegistered = false
         }
-        // 注销到期回调并取消计时任务（授权状态保持不变，服务重连语义由 M0.7 验证）。
+        // 注销到期回调、取消计时任务，并撤销全部内存授权（M0.7，ROADMAP：
+        // 服务断开后不恢复内存授权，重新进入豆包按未授权处理；开关无障碍 = 授权作废）。
         prototypeAccessController.clearOnExpired()
         prototypeAccessController.cancelScheduledExpiry()
+        prototypeAccessController.revoke("守卫服务已断开")
         if (::interceptionOverlay.isInitialized) {
             interceptionOverlay.hide()
         }

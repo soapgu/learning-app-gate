@@ -137,6 +137,22 @@ class PrototypeAccessController(
         scheduler.cancel()
     }
 
+    /**
+     * 服务重连自愈（M0.7）：状态为 Active 时按当前剩余额度（重）排一次到期任务。
+     *
+     * 覆盖"计时曾被取消而授权仍 Active"的罕见路径（如服务销毁取消计时后 ROM
+     * 未真正杀死进程又重连），防额度永不到期。调度器的新任务会替换旧任务，
+     * 天然不产生重复到期；到期触发时 [handleExpiry] 仍会重算实际剩余。
+     * 非 Active 状态 no-op。
+     */
+    fun ensureExpiryScheduled() = synchronized(lock) {
+        val nowMs = clock()
+        val active = stateMachine.state as? LaunchAuthorizationState.Active ?: return
+        val remainingMs = active.remainingMs(nowMs)
+        scheduler.postDelayed(remainingMs, ::handleExpiry)
+        log("服务重连自愈：补排到期任务 remainingMs=$remainingMs elapsedRealtime=$nowMs")
+    }
+
     /** 清除到期回调（服务销毁时注销，防泄漏）。 */
     fun clearOnExpired() {
         onExpired = null

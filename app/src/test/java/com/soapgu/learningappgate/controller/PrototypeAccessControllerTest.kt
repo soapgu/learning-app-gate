@@ -292,6 +292,75 @@ class PrototypeAccessControllerTest {
     }
 
     @Test
+    fun expiry_thenLatePauseEvent_noDoubleTransition() {
+        val h = Harness()
+        h.controller.onExpired = { h.expiredCount += 1 }
+        h.activate(totalMs = 30_000L, atMs = 2_000L)
+
+        // 交错顺序一：到期先行收回，随后"离开前台"事件迟到 -> Revoked no-op，
+        // 回调恰好一次、状态转换唯一（验收：无重复到期处理）。
+        h.nowMs = 32_000L
+        h.scheduler.fire()
+        assertEquals(1, h.expiredCount)
+        h.nowMs = 32_100L
+        h.controller.onTargetLeftForeground()
+        assertTrue(h.controller.state is LaunchAuthorizationState.Revoked)
+        assertEquals(1, h.expiredCount)
+    }
+
+    @Test
+    fun lazyFallback_thenLateTimer_noDoubleRecall() {
+        val h = Harness()
+        h.controller.onExpired = { h.expiredCount += 1 }
+        h.activate(totalMs = 30_000L, atMs = 2_000L)
+
+        // 交错顺序二：定时器丢失，前台事件惰性兜底先收回（不触发到期回调）；
+        // 迟到的定时任务随后触发 -> 非 Active 幂等忽略，仍无回调。
+        h.nowMs = 32_100L
+        assertFalse(h.controller.onTargetForeground())
+        assertTrue(h.controller.state is LaunchAuthorizationState.Revoked)
+        h.nowMs = 32_150L
+        h.scheduler.fire()
+        assertEquals(0, h.expiredCount)
+        assertTrue(h.controller.state is LaunchAuthorizationState.Revoked)
+    }
+
+    @Test
+    fun ensureExpiryScheduled_afterLostTimer_reschedulesRemaining() {
+        val h = Harness()
+        h.controller.onExpired = { h.expiredCount += 1 }
+        h.activate(totalMs = 30_000L, atMs = 2_000L)
+
+        // 服务重连自愈：计时丢失（如曾被取消）后补排当前剩余额度，到期正常收回恰好一次。
+        h.nowMs = 12_000L
+        h.controller.cancelScheduledExpiry()
+        h.controller.ensureExpiryScheduled()
+        assertEquals(20_000L, h.scheduler.postedDelayMs)
+
+        h.nowMs = 32_000L
+        h.scheduler.fire()
+        assertTrue(h.controller.state is LaunchAuthorizationState.Revoked)
+        assertEquals(1, h.expiredCount)
+    }
+
+    @Test
+    fun ensureExpiryScheduled_outsideActive_isNoOp() {
+        val h = Harness()
+
+        // 非 Active（Idle）不排任务。
+        h.controller.ensureExpiryScheduled()
+        assertEquals(null, h.scheduler.postedDelayMs)
+
+        // Paused 也不排任务：不重排（postedDelayMs 保持激活时的旧值）、不清除取消标记。
+        h.activate(totalMs = 30_000L, atMs = 2_000L)
+        h.nowMs = 12_000L
+        h.controller.onTargetLeftForeground()
+        h.controller.ensureExpiryScheduled()
+        assertEquals(30_000L, h.scheduler.postedDelayMs)
+        assertTrue(h.scheduler.isCancelled)
+    }
+
+    @Test
     fun remainingMs_whilePaused_frozenAtSettledValue() {
         val h = Harness()
         h.activate(totalMs = 30_000L, atMs = 2_000L)
