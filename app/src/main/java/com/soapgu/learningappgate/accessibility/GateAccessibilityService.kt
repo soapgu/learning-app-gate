@@ -32,6 +32,10 @@ class GateAccessibilityService : AccessibilityService() {
     private val interceptionStateMachine = GateInterceptionStateMachine()
     private val mainHandler = Handler(Looper.getMainLooper())
     private lateinit var interceptionOverlay: InterceptionOverlay
+    private lateinit var remainingTimeOverlay: RemainingTimeOverlay
+
+    /** 剩余时间胶囊的每秒刷新任务；非 Active 或豆包离开前台时取消。 */
+    private var remainingTimeRefreshRunnable: Runnable? = null
 
     /** 本会话待显示的拦截提示（null 表示无）；会话结束时（豆包真正离开前台）显示并清除。 */
     private var pendingOverlayNoticeMessage: String? = null
@@ -56,6 +60,7 @@ class GateAccessibilityService : AccessibilityService() {
                 Intent.ACTION_SCREEN_OFF -> {
                     Logger.d("屏幕关闭：挂起计时 elapsedRealtime=${SystemClock.elapsedRealtime()}")
                     prototypeAccessController.onScreenOff()
+                    stopRemainingTimeOverlay()
                 }
 
                 Intent.ACTION_USER_PRESENT -> {
@@ -71,7 +76,9 @@ class GateAccessibilityService : AccessibilityService() {
                             "解锁且豆包在前台：恢复计时 activePackage=$activePackage " +
                                 "elapsedRealtime=${SystemClock.elapsedRealtime()}",
                         )
-                        prototypeAccessController.onTargetForeground()
+                        if (prototypeAccessController.onTargetForeground()) {
+                            startOrRefreshRemainingTimeOverlay()
+                        }
                     }
                 }
             }
@@ -84,6 +91,7 @@ class GateAccessibilityService : AccessibilityService() {
         // TYPE_ACCESSIBILITY_OVERLAY 窗口由已绑定的无障碍服务直接创建即可，无需额外 flag
         //（与官方 GlobalActionBarService 示例一致）。
         interceptionOverlay = InterceptionOverlay(this)
+        remainingTimeOverlay = RemainingTimeOverlay(this)
         // 到期收回（M0.5）：控制器已原子化转 Revoked 后回调；走与未授权拦截相同的
         // 拦截状态机（进入抑制态）与 BACK 管线，后续 class 变化由精准补发兜底，
         // 豆包由守卫入口启动，BACK 会自然退回守卫 App（用户决策，替代原定 HOME）。
@@ -132,6 +140,9 @@ class GateAccessibilityService : AccessibilityService() {
                 cancelPendingPauseRecheck()
                 cancelPendingExpiryRecheck()
                 permitted = prototypeAccessController.onTargetForeground()
+                if (permitted) {
+                    startOrRefreshRemainingTimeOverlay()
+                }
                 val className = event.className?.toString()
                 val targetDecision = if (permitted) {
                     // 放行期间不驱动拦截状态机（decision 为 null）。
@@ -224,6 +235,7 @@ class GateAccessibilityService : AccessibilityService() {
         if (::interceptionOverlay.isInitialized) {
             interceptionOverlay.hide()
         }
+        stopRemainingTimeOverlay()
         super.onDestroy()
     }
 
@@ -232,6 +244,7 @@ class GateAccessibilityService : AccessibilityService() {
      * [noticeMessage] 为延迟提示的文案（未授权拦截与额度到期收回各有专属提示）。
      */
     private fun performInterception(nowMs: Long, noticeMessage: String) {
+        stopRemainingTimeOverlay()
         when (val exitAction = InterceptionActionPolicy.exitAction) {
             ExitAction.BACK -> performBackInterception(nowMs)
             ExitAction.HOME -> performHomeInterception(nowMs)
@@ -376,6 +389,7 @@ class GateAccessibilityService : AccessibilityService() {
             "豆包已离开前台：root=${activePackage ?: "未解析"} package=$eventPackage " +
                 "elapsedRealtime=$nowMs",
         )
+        stopRemainingTimeOverlay()
         prototypeAccessController.onTargetLeftForeground()
         if (interceptionStateMachine.isSuppressing) {
             finishInterceptionSession(activePackage ?: eventPackage, nowMs)
@@ -386,6 +400,8 @@ class GateAccessibilityService : AccessibilityService() {
 
     /** 到期回调的严格仲裁：Unknown 只复检一次，仍未知时跳过 BACK。 */
     private fun arbitrateExpiryInterception() {
+        // 控制器已先转为 Revoked；无论当前前台判定结果如何，倒计时都必须立即消失。
+        stopRemainingTimeOverlay()
         val nowMs = SystemClock.elapsedRealtime()
         when (val state = currentActiveWindowTargetState()) {
             ActiveWindowTargetState.Target -> performExpiryInterception(nowMs)
@@ -426,6 +442,33 @@ class GateAccessibilityService : AccessibilityService() {
     private fun currentActiveWindowTargetState(): ActiveWindowTargetState =
         ActiveWindowTargetPolicy.classify(rootInActiveWindow?.packageName, TargetApps.DOUBAO)
 
+    /** 立即刷新一次并确保只有一个每秒任务在队列中。 */
+    private fun startOrRefreshRemainingTimeOverlay() {
+        val state = prototypeAccessController.state
+        if (!RemainingTimeDisplayPolicy.shouldShow(state)) {
+            stopRemainingTimeOverlay()
+            return
+        }
+        remainingTimeOverlay.showOrUpdate(prototypeAccessController.remainingMs())
+        if (remainingTimeRefreshRunnable == null) {
+            Runnable {
+                remainingTimeRefreshRunnable = null
+                startOrRefreshRemainingTimeOverlay()
+            }.also { runnable ->
+                remainingTimeRefreshRunnable = runnable
+                mainHandler.postDelayed(runnable, REMAINING_TIME_REFRESH_INTERVAL_MS)
+            }
+        }
+    }
+
+    private fun stopRemainingTimeOverlay() {
+        remainingTimeRefreshRunnable?.let(mainHandler::removeCallbacks)
+        remainingTimeRefreshRunnable = null
+        if (::remainingTimeOverlay.isInitialized) {
+            remainingTimeOverlay.hide()
+        }
+    }
+
     private companion object {
         // 与无障碍服务 XML 中声明的事件类型保持一致，避免处理无关的页面内容事件。
         val OBSERVED_EVENT_TYPES = setOf(
@@ -436,6 +479,8 @@ class GateAccessibilityService : AccessibilityService() {
         // M0.6 暂停仲裁的延迟复检间隔：窗口切换过渡态（rootInActiveWindow 为 null）
         // 通常在数百毫秒内结束；复检过早会仍在过渡态，过晚会延迟暂停结算。
         const val WINDOW_RECHECK_DELAY_MS = 300L
+
+        const val REMAINING_TIME_REFRESH_INTERVAL_MS = 1_000L
 
         // M0.3-plus 拦截提示开关：覆盖层在拦截瞬间显示会引发死循环（其窗口事件在
         // 抑制期内被当作"豆包已离开"重置状态机），现改为延迟到会话结束（豆包真正

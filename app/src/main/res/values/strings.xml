@@ -28,6 +28,7 @@
     <string name="exit_action_home">回到桌面</string>
     <string name="interception_message">现在还不能使用豆包哦</string>
     <string name="time_expired_message">本次使用时间已结束</string>
+    <string name="remaining_time_overlay">剩余 %1$s</string>
     <string name="interception_count">已拦截：%1$d 次</string>
     <string name="interception_last_at">最近拦截：%1$d 秒前</string>
 </resources>
