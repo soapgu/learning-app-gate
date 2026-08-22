@@ -43,6 +43,10 @@ class GateAccessibilityService : AccessibilityService() {
     /** 本会话最近一次豆包前台事件的 class；用于识别"页面被 BACK 回退"的 class 变化。 */
     private var lastTargetClassName: String? = null
 
+    /** 早于安全补发间隔到达的真实 class 变化；保留旧基线并延迟复检，避免信号被提前消费。 */
+    private var pendingBackRefillRunnable: Runnable? = null
+    private val backRefillRecheckCoordinator = BackRefillRecheckCoordinator()
+
     /**
      * M0.6 暂停仲裁：排队中的"活跃窗口过渡态"延迟复检（爆发式事件只排一次）。
      * 豆包前台事件到达时作废（豆包窗口事件是前台的确定性证据，见 cancelPendingPauseRecheck）。
@@ -141,9 +145,11 @@ class GateAccessibilityService : AccessibilityService() {
                 cancelPendingExpiryRecheck()
                 permitted = prototypeAccessController.onTargetForeground()
                 if (permitted) {
+                    cancelPendingBackRefill()
                     startOrRefreshRemainingTimeOverlay()
                 }
                 val className = event.className?.toString()
+                backRefillRecheckCoordinator.observeTargetClass(className)
                 val targetDecision = if (permitted) {
                     // 放行期间不驱动拦截状态机（decision 为 null）。
                     null
@@ -151,7 +157,7 @@ class GateAccessibilityService : AccessibilityService() {
                     // 先识别 class 变化：抑制期内豆包 class 变化说明第一发 BACK 被用于
                     // 页面回退（如 MainActivity -> DrawerLayout），是精准补发第二发的信号。
                     val previousClassName = lastTargetClassName
-                    if (previousClassName != null && className != previousClassName) {
+                    if (previousClassName != null && className != null && className != previousClassName) {
                         val activeWindowState = currentActiveWindowTargetState()
                         if (!ActiveWindowTargetPolicy.allowsEventDrivenBackRefill(activeWindowState)) {
                             // 条件驱动补发（2026-08-22 真机结论）：BACK 注入与豆包退出存在
@@ -161,14 +167,17 @@ class GateAccessibilityService : AccessibilityService() {
                                 "跳过精准补发：活跃窗口已非豆包 " +
                                     "current=${rootInActiveWindow?.packageName} elapsedRealtime=$nowMs",
                             )
-                        } else if (interceptionStateMachine.onTargetClassChanged(nowMs)) {
-                            refilledBack = true
-                            Logger.d(
-                                "精准补发：豆包页面回退 class=$previousClassName -> $className " +
-                                    "refill=${interceptionStateMachine.backRefillCount} " +
-                                    "elapsedRealtime=$nowMs",
-                            )
-                            performGlobalAction(GLOBAL_ACTION_BACK)
+                        } else {
+                            when (val delayMs = interceptionStateMachine.backRefillDelayMs(nowMs)) {
+                                null -> Unit
+                                0L -> {
+                                    cancelPendingBackRefill()
+                                    if (performBackRefill(previousClassName, className, nowMs)) {
+                                        refilledBack = true
+                                    }
+                                }
+                                else -> scheduleBackRefillRecheck(previousClassName, delayMs, nowMs)
+                            }
                         }
                     }
                     interceptionStateMachine.onTargetForeground(nowMs)
@@ -178,7 +187,10 @@ class GateAccessibilityService : AccessibilityService() {
                 // 不维护基线导致到期只发一发 BACK，退出失败）。
                 // 必须放在上面的比较之后：若提前覆盖基线，className == lastTargetClassName
                 // 恒成立，精准补发永远不触发。
-                lastTargetClassName = className
+                // 过早到达的变化必须保留旧基线，直到延迟复检真正补发或信号被取消。
+                if (!backRefillRecheckCoordinator.hasPendingRecheck) {
+                    lastTargetClassName = className
+                }
                 targetDecision
             }
 
@@ -244,6 +256,7 @@ class GateAccessibilityService : AccessibilityService() {
      * [noticeMessage] 为延迟提示的文案（未授权拦截与额度到期收回各有专属提示）。
      */
     private fun performInterception(nowMs: Long, noticeMessage: String) {
+        cancelPendingBackRefill()
         stopRemainingTimeOverlay()
         when (val exitAction = InterceptionActionPolicy.exitAction) {
             ExitAction.BACK -> performBackInterception(nowMs)
@@ -258,6 +271,7 @@ class GateAccessibilityService : AccessibilityService() {
      * 此时覆盖层出现在豆包已离开之后，其自身窗口事件落在 Idle 态，不再干扰状态机。
      */
     private fun finishInterceptionSession(currentForegroundPackage: String, nowMs: Long) {
+        cancelPendingBackRefill()
         interceptionStateMachine.onOtherForeground()
         Logger.d(
             "会话结束：豆包已离开前台，当前前台=$currentForegroundPackage " +
@@ -389,6 +403,7 @@ class GateAccessibilityService : AccessibilityService() {
             "豆包已离开前台：root=${activePackage ?: "未解析"} package=$eventPackage " +
                 "elapsedRealtime=$nowMs",
         )
+        cancelPendingBackRefill()
         stopRemainingTimeOverlay()
         prototypeAccessController.onTargetLeftForeground()
         if (interceptionStateMachine.isSuppressing) {
@@ -441,6 +456,58 @@ class GateAccessibilityService : AccessibilityService() {
 
     private fun currentActiveWindowTargetState(): ActiveWindowTargetState =
         ActiveWindowTargetPolicy.classify(rootInActiveWindow?.packageName, TargetApps.DOUBAO)
+
+    /** class 变化过早时排一次复检；后续变化会替换为最新信号，但仍以原页面为基线。 */
+    private fun scheduleBackRefillRecheck(fromClass: String, delayMs: Long, nowMs: Long) {
+        pendingBackRefillRunnable?.let(mainHandler::removeCallbacks)
+        backRefillRecheckCoordinator.schedule(fromClass)
+        Runnable {
+            pendingBackRefillRunnable = null
+            val recheckNowMs = SystemClock.elapsedRealtime()
+            val stillTarget = currentActiveWindowTargetState() == ActiveWindowTargetState.Target
+            when (val decision = backRefillRecheckCoordinator.consumeRecheck(stillTarget)) {
+                is BackRefillRecheckDecision.Refill -> {
+                    if (performBackRefill(decision.fromClass, decision.toClass, recheckNowMs)) {
+                        lastTargetClassName = decision.toClass
+                    }
+                }
+
+                is BackRefillRecheckDecision.Cancel -> {
+                    Logger.d(
+                        "取消延迟补发：target=$stillTarget baseline=${decision.baselineClass} " +
+                            "latest=${backRefillRecheckCoordinator.latestTargetClass} elapsedRealtime=$recheckNowMs",
+                    )
+                    decision.baselineClass?.let { lastTargetClassName = it }
+                }
+            }
+        }.also { runnable ->
+            pendingBackRefillRunnable = runnable
+            mainHandler.postDelayed(runnable, delayMs)
+        }
+        Logger.d(
+            "精准补发延迟复检：class=$fromClass -> ${backRefillRecheckCoordinator.latestTargetClass} " +
+                "delayMs=$delayMs " +
+                "elapsedRealtime=$nowMs",
+        )
+    }
+
+    private fun performBackRefill(fromClass: String, toClass: String, nowMs: Long): Boolean {
+        if (!interceptionStateMachine.onTargetClassChanged(nowMs)) {
+            return false
+        }
+        Logger.d(
+            "精准补发：豆包页面回退 class=$fromClass -> $toClass " +
+                "refill=${interceptionStateMachine.backRefillCount} elapsedRealtime=$nowMs",
+        )
+        performGlobalAction(GLOBAL_ACTION_BACK)
+        return true
+    }
+
+    private fun cancelPendingBackRefill() {
+        pendingBackRefillRunnable?.let(mainHandler::removeCallbacks)
+        pendingBackRefillRunnable = null
+        backRefillRecheckCoordinator.cancel()
+    }
 
     /** 立即刷新一次并确保只有一个每秒任务在队列中。 */
     private fun startOrRefreshRemainingTimeOverlay() {

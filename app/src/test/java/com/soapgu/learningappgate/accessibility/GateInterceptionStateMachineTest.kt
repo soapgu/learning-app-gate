@@ -146,6 +146,30 @@ class GateInterceptionStateMachineTest {
     }
 
     @Test
+    fun backRefillDelayMs_reportsRetryDelayWithoutConsumingQuota() {
+        val stateMachine = machine()
+        stateMachine.onTargetForeground(nowMs = 1_000L)
+
+        assertEquals(349L, stateMachine.backRefillDelayMs(nowMs = 1_051L))
+        assertEquals(0, stateMachine.backRefillCount)
+        assertEquals(0L, stateMachine.backRefillDelayMs(nowMs = 1_400L))
+
+        assertTrue(stateMachine.onTargetClassChanged(nowMs = 1_400L))
+        assertEquals(400L, stateMachine.backRefillDelayMs(nowMs = 1_400L))
+    }
+
+    @Test
+    fun backRefillDelayMs_outsideSessionOrAfterQuota_returnsNull() {
+        val stateMachine = machine()
+        assertEquals(null, stateMachine.backRefillDelayMs(nowMs = 1_000L))
+
+        stateMachine.onTargetForeground(nowMs = 1_000L)
+        assertTrue(stateMachine.onTargetClassChanged(nowMs = 1_400L))
+        assertTrue(stateMachine.onTargetClassChanged(nowMs = 1_800L))
+        assertEquals(null, stateMachine.backRefillDelayMs(nowMs = 2_200L))
+    }
+
+    @Test
     fun onTargetClassChanged_intervalMeasuredFromLastBack_includingRefill() {
         val stateMachine = machine()
         stateMachine.onTargetForeground(nowMs = 1_000L)

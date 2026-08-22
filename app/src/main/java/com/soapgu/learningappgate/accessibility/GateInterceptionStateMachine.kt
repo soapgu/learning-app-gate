@@ -97,6 +97,17 @@ class GateInterceptionStateMachine(
         return true
     }
 
+    /**
+     * 当前 class 变化距离安全补发窗口还需等待多久。
+     * null 表示当前会话/配额不允许补发，0 表示可以立即补发，正数表示应延迟复检。
+     */
+    fun backRefillDelayMs(nowMs: Long): Long? {
+        if (state !is GateInterceptionState.Intercepted || backRefillCount >= MAX_BACK_REFILLS) {
+            return null
+        }
+        return (MIN_BACK_INTERVAL_MS - (nowMs - lastBackAtMs)).coerceAtLeast(0L)
+    }
+
     /** 非目标应用进入前台时调用；目标已实际离开，本会话结束，恢复可拦截状态。 */
     fun onOtherForeground() {
         state = GateInterceptionState.Idle
