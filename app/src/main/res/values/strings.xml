@@ -6,6 +6,8 @@
     <string name="target_not_installed">未安装目标应用</string>
     <string name="target_no_launch_activity">目标应用没有可用的启动入口</string>
     <string name="launch_failed">启动失败：%1$s</string>
+    <string name="launch_without_authorization">未授权启动%1$s</string>
+    <string name="launch_unauthorized_started">已按未授权模式启动：%1$s</string>
     <string name="authorize_30s_and_launch">授权 30 秒并启动%1$s</string>
     <string name="authorize_10min_and_launch">授权 10 分钟并启动%1$s</string>
     <string name="launch_authorized_started">已授权启动：%1$s</string>

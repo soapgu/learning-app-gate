@@ -93,6 +93,7 @@ class MainActivity : ComponentActivity() {
                     authorizationState = authorizationState,
                     authorizationRemainingMs = authorizationRemainingMs,
                     launchMessage = launchMessage,
+                    onLaunchWithoutAuthorization = ::launchTargetAppWithoutAuthorization,
                     onLaunch = ::authorizeAndLaunchTargetApp,
                     onOpenAccessibilitySettings = ::openAccessibilitySettings,
                 )
@@ -130,6 +131,25 @@ class MainActivity : ComponentActivity() {
             ?.let { (SystemClock.elapsedRealtime() - it) / 1000 }
         exitAction = InterceptionActionPolicy.exitAction
         // 读取快照会做惰性超时判定：过期的 Pending 直接显示为已失效。
+        authorizationState = prototypeAccessController.state
+        authorizationRemainingMs = prototypeAccessController.remainingMs()
+    }
+
+    /**
+     * Debug 未授权启动验证：先撤销所有残留内存授权，再直接发送目标应用启动 Intent。
+     * 豆包进入前台后应由无障碍服务按未授权链路立即拦截。
+     */
+    private fun launchTargetAppWithoutAuthorization() {
+        prototypeAccessController.revoke("Debug 未授权启动验证")
+        launchMessage = when (val result = targetAppLauncher.launch(TargetApps.DOUBAO)) {
+            is TargetAppLaunchResult.Started -> getString(
+                R.string.launch_unauthorized_started,
+                result.componentName.flattenToShortString(),
+            )
+            TargetAppLaunchResult.NotInstalled -> getString(R.string.target_not_installed)
+            TargetAppLaunchResult.NoLaunchActivity -> getString(R.string.target_no_launch_activity)
+            is TargetAppLaunchResult.Failed -> getString(R.string.launch_failed, result.reason)
+        }
         authorizationState = prototypeAccessController.state
         authorizationRemainingMs = prototypeAccessController.remainingMs()
     }
@@ -211,6 +231,7 @@ fun MainScreen(
     authorizationState: LaunchAuthorizationState,
     authorizationRemainingMs: Long,
     launchMessage: String?,
+    onLaunchWithoutAuthorization: () -> Unit,
     onLaunch: (Long) -> Unit,
     onOpenAccessibilitySettings: () -> Unit,
     modifier: Modifier = Modifier,
@@ -229,6 +250,7 @@ fun MainScreen(
             authorizationState = authorizationState,
             authorizationRemainingMs = authorizationRemainingMs,
             launchMessage = launchMessage,
+            onLaunchWithoutAuthorization = onLaunchWithoutAuthorization,
             onLaunch = onLaunch,
             onOpenAccessibilitySettings = onOpenAccessibilitySettings,
         )
@@ -249,6 +271,7 @@ private fun MainContent(
     authorizationState: LaunchAuthorizationState,
     authorizationRemainingMs: Long,
     launchMessage: String?,
+    onLaunchWithoutAuthorization: () -> Unit,
     onLaunch: (Long) -> Unit,
     onOpenAccessibilitySettings: () -> Unit,
 ) {
@@ -319,6 +342,13 @@ private fun MainContent(
         }
         Spacer(modifier = Modifier.height(24.dp))
         if (debugFeaturesEnabled) {
+            OutlinedButton(
+                onClick = onLaunchWithoutAuthorization,
+                enabled = resolution is TargetAppResolution.Available,
+            ) {
+                Text(stringResource(R.string.launch_without_authorization, targetApp.displayName))
+            }
+            Spacer(modifier = Modifier.height(8.dp))
             // M0.5 两档限时授权入口：仅 Debug 构建渲染（Release 不暴露时长入口）。
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(
@@ -414,6 +444,7 @@ private fun MainScreenPreview() {
             authorizationState = LaunchAuthorizationState.Idle,
             authorizationRemainingMs = 0L,
             launchMessage = null,
+            onLaunchWithoutAuthorization = {},
             onLaunch = {},
             onOpenAccessibilitySettings = {},
         )
