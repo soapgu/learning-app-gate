@@ -17,3 +17,11 @@ M0 真机可行性原型已经完成，并在目标真机上通过完整功能�
 - 服务关闭或进程重建后恢复为未授权，不保留 M0 内存授权。
 
 M0 的实现范围、技术决策和验收结论参见 [ROADMAP.md](ROADMAP.md) 与 [M0 总体验收记录](docs/validation/M0.md)。后续里程碑将继续实现访问时段、每日累计额度和学习任务。
+
+## 项目文档
+
+- [项目路线图](ROADMAP.md)
+- [M0 真机可行性原型](docs/milestones/M0.md)（已完成）
+- [M1 访问时间限制](docs/milestones/M1.md)（待实现）
+- [M0 总体验收记录](docs/validation/M0.md)
+- [分阶段真机验收记录](docs/validation/)
