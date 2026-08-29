@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">豆包访问守卫</string>
+    <string name="app_name">豆包</string>
     <string name="target_package">目标包名：%1$s</string>
     <string name="target_available">已安装，启动入口：%1$s</string>
     <string name="target_not_installed">未安装目标应用</string>
@@ -31,4 +31,36 @@
     <string name="remaining_time_overlay">剩余 %1$s</string>
     <string name="interception_count">已拦截：%1$d 次</string>
     <string name="interception_last_at">最近拦截：%1$d 秒前</string>
+    <string name="home_subtitle">受控访问入口</string>
+    <string name="home_open_menu">打开菜单</string>
+    <string name="home_guard_status">守卫状态</string>
+    <string name="home_allowed_window">每日时段</string>
+    <string name="home_accessibility_status">无障碍守卫</string>
+    <string name="home_target_status">官方豆包</string>
+    <string name="home_enabled">已开启</string>
+    <string name="home_disabled">未开启</string>
+    <string name="home_security_note">当前页面仅展示规则和设备状态，不提供聊天或内容生成功能。</string>
+    <string name="home_rules">使用规则</string>
+    <string name="home_enable_guard">开启守卫</string>
+    <string name="home_installation">安装状态</string>
+    <string name="home_about">应用说明</string>
+    <string name="home_integration_pending">访问控制接入中</string>
+    <string name="home_integration_pending_detail">时间规则已经准备完成，无障碍服务接入前暂不开放普通启动入口。</string>
+    <string name="home_status_target_unavailable">暂时无法使用</string>
+    <string name="home_target_unavailable_detail">未检测到可启动的官方豆包，请先确认应用已正确安装。</string>
+    <string name="home_status_allowed">当前可以使用</string>
+    <string name="home_allowed_detail">本次时段将在 %1$s 结束。</string>
+    <string name="home_status_outside">当前不在使用时段</string>
+    <string name="home_outside_detail">下一次开放时间：%1$s。</string>
+    <string name="home_target_installed">已安装</string>
+    <string name="home_target_not_installed">未安装</string>
+    <string name="home_target_no_entry">无启动入口</string>
+    <string name="home_rules_detail">每天 %1$s 可以使用官方豆包。开始时间包含在允许范围内，结束时间到达后立即停止使用。</string>
+    <string name="home_target_installed_detail">已检测到官方豆包及其启动入口。</string>
+    <string name="home_target_not_installed_detail">未检测到官方豆包，请先通过可信来源完成安装。</string>
+    <string name="home_target_no_entry_detail">已检测到官方豆包，但系统没有返回可用的启动入口。</string>
+    <string name="home_about_detail">这是打开官方豆包的受控入口，用于展示访问规则和守卫状态。本应用不提供聊天、内容生成，也不会替换或隐藏官方豆包。</string>
+    <string name="home_dialog_ok">知道了</string>
+    <string name="home_drawer_title">豆包访问守卫</string>
+    <string name="home_controlled_entry_note">本应用是官方豆包的受控入口。访问控制接入完成前，Release 构建不会启动官方豆包。</string>
 </resources>

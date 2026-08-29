@@ -5,6 +5,8 @@ import android.content.pm.ApplicationInfo
 import android.os.Bundle
 import android.os.SystemClock
 import android.provider.Settings
+import androidx.activity.SystemBarStyle
+import androidx.activity.compose.BackHandler
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -48,6 +50,8 @@ import com.soapgu.learningappgate.target.TargetAppLauncher
 import com.soapgu.learningappgate.target.TargetAppResolution
 import com.soapgu.learningappgate.target.TargetApps
 import com.soapgu.learningappgate.ui.theme.LearningAppGateTheme
+import com.soapgu.learningappgate.ui.home.HomeRoute
+import com.soapgu.learningappgate.ui.home.buildHomeUiState
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -55,9 +59,15 @@ import kotlinx.coroutines.launch
 private const val AUTHORIZATION_SHORT_MS = 30_000L
 private const val AUTHORIZATION_LONG_MS = 600_000L
 
+private enum class AppScreen {
+    HOME,
+    DIAGNOSTICS,
+}
+
 /**
- * M0 阶段的诊断主页；M0.5 起提供 30 秒 / 10 分钟两档限时"授权并启动豆包"入口
- * （仅 Debug 构建，Release 不暴露）。
+ * M0 诊断页的宿主及系统动作协调器。M1.2 起默认展示豆包风格受控首页，诊断页仅能在
+ * Debug 构建中长按标题 5 秒进入；Release 不注册入口。诊断页继续提供 30 秒 / 10 分钟
+ * 两档限时"授权并启动豆包"能力，用于独立回归 M0。
  *
  * 授权流程：解析成功 -> 创建 Pending 授权（5 秒有效）-> 发送官方启动 Intent；
  * 豆包进入前台后由无障碍事件驱动激活并起算额度，到期由控制器收回并走 BACK 拦截；
@@ -73,30 +83,47 @@ class MainActivity : ComponentActivity() {
     private var exitAction by mutableStateOf(InterceptionActionPolicy.exitAction)
     private var authorizationState by mutableStateOf<LaunchAuthorizationState>(LaunchAuthorizationState.Idle)
     private var authorizationRemainingMs by mutableStateOf(0L)
+    private var currentScreen by mutableStateOf(AppScreen.HOME)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         targetAppLauncher = TargetAppLauncher(applicationContext)
         refreshStatus()
-        enableEdgeToEdge()
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.light(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.light(android.graphics.Color.WHITE, android.graphics.Color.WHITE),
+        )
         setContent {
             LearningAppGateTheme {
-                MainScreen(
-                    targetApp = TargetApps.DOUBAO,
-                    resolution = resolution,
-                    accessibilityEnabled = accessibilityEnabled,
-                    interceptionCount = interceptionCount,
-                    lastInterceptionSeconds = lastInterceptionSeconds,
-                    exitAction = exitAction,
-                    onExitActionChange = ::selectExitAction,
-                    debugFeaturesEnabled = isDebugFeaturesEnabled(),
-                    authorizationState = authorizationState,
-                    authorizationRemainingMs = authorizationRemainingMs,
-                    launchMessage = launchMessage,
-                    onLaunchWithoutAuthorization = ::launchTargetAppWithoutAuthorization,
-                    onLaunch = ::authorizeAndLaunchTargetApp,
-                    onOpenAccessibilitySettings = ::openAccessibilitySettings,
-                )
+                when (currentScreen) {
+                    AppScreen.HOME -> HomeRoute(
+                        state = buildHomeUiState(resolution, accessibilityEnabled),
+                        debugFeaturesEnabled = isDebugFeaturesEnabled(),
+                        onOpenDiagnostics = {
+                            if (isDebugFeaturesEnabled()) currentScreen = AppScreen.DIAGNOSTICS
+                        },
+                        onOpenAccessibilitySettings = ::openAccessibilitySettings,
+                    )
+                    AppScreen.DIAGNOSTICS -> {
+                        BackHandler { currentScreen = AppScreen.HOME }
+                        DiagnosticsScreen(
+                            targetApp = TargetApps.DOUBAO,
+                            resolution = resolution,
+                            accessibilityEnabled = accessibilityEnabled,
+                            interceptionCount = interceptionCount,
+                            lastInterceptionSeconds = lastInterceptionSeconds,
+                            exitAction = exitAction,
+                            onExitActionChange = ::selectExitAction,
+                            debugFeaturesEnabled = isDebugFeaturesEnabled(),
+                            authorizationState = authorizationState,
+                            authorizationRemainingMs = authorizationRemainingMs,
+                            launchMessage = launchMessage,
+                            onLaunchWithoutAuthorization = ::launchTargetAppWithoutAuthorization,
+                            onLaunch = ::authorizeAndLaunchTargetApp,
+                            onOpenAccessibilitySettings = ::openAccessibilitySettings,
+                        )
+                    }
+                }
             }
         }
         // 前台期间每秒刷新授权快照与剩余额度：支撑"到期后 1 秒内收回"的真机观察，
@@ -219,7 +246,7 @@ class MainActivity : ComponentActivity() {
  * 主页的无状态 Compose 入口，所有系统操作均通过回调交给 Activity 执行。
  */
 @Composable
-fun MainScreen(
+fun DiagnosticsScreen(
     targetApp: TargetApp,
     resolution: TargetAppResolution,
     accessibilityEnabled: Boolean,
@@ -423,9 +450,9 @@ private fun resolutionDescription(resolution: TargetAppResolution): String {
 
 @Preview(showBackground = true)
 @Composable
-private fun MainScreenPreview() {
+private fun DiagnosticsScreenPreview() {
     LearningAppGateTheme {
-        MainScreen(
+        DiagnosticsScreen(
             targetApp = TargetApps.DOUBAO,
             // 预览组件只用于展示界面；正式启动时始终由 PackageManager 动态解析。
             resolution = TargetAppResolution.Available(

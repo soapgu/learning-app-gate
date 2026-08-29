@@ -1,0 +1,20 @@
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <!--
+        Adaptive icon launchers reserve the outer 18dp for parallax and may crop it.
+        Keep the avatar disk just inside that area so OEM masks cannot remove it.
+    -->
+    <item
+        android:bottom="20dp"
+        android:left="20dp"
+        android:right="20dp"
+        android:top="20dp">
+        <bitmap android:gravity="fill" android:src="@drawable/doubao_guard_avatar_v3" />
+    </item>
+    <item
+        android:width="24dp"
+        android:height="24dp"
+        android:bottom="20dp"
+        android:drawable="@drawable/ic_launcher_badge"
+        android:gravity="bottom|right"
+        android:right="20dp" />
+</layer-list>
